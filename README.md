@@ -16,7 +16,7 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 ## Highlights
 
 - A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that thinks before it decides, with a block-4 diffusion drafter and the full training code and train/dev/test data.
-- Beats Kev-9B and Jev on data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
+- Beats Kev-9B and Jev on the test benchmarks (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
 - Calibrated out of the box: a fitted temperature brings top-label calibration error to 0.021 and confident errors (wrong at p ≥ 0.9) to 1.3% of answers.
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
 - About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Truncating chains and skipping thinking for confident questions cuts the median to 2.0 s for about one point of accuracy.
@@ -34,22 +34,22 @@ Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are 
 
 | bench                                            | Kev-9B                          | Jev                             | Jeeves                          |
 | ------------------------------------------------ | ------------------------------- | ------------------------------- | ------------------------------- |
-| **Out-of-domain overall** (item-weighted)        | 0.822                           | 0.857                           | $\color{green}{\textbf{0.889}}$ |
-| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | $\color{green}{\textbf{0.800}}$ | 0.746                           |
-| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | $\color{green}{\textbf{0.935}}$ |
-| QNLI                                             | $\color{green}{\textbf{0.925}}$ | $\color{green}{\textbf{0.925}}$ | 0.913                           |
-| SciQ                                             | 0.963                           | 0.988                           | $\color{green}{\textbf{0.991}}$ |
-| TweetEval offensive                              | 0.775                           | $\color{green}{\textbf{0.813}}$ | $\color{green}{\textbf{0.813}}$ |
-| PAWS                                             | 0.763                           | 0.788                           | $\color{green}{\textbf{0.875}}$ |
-| MMLU                                             | 0.738                           | $\color{green}{\textbf{0.900}}$ | 0.793                           |
-| Emotion                                          | 0.600                           | 0.588                           | $\color{green}{\textbf{0.647}}$ |
-| Held-out rule structures                         | 0.896                           | 0.885                           | $\color{green}{\textbf{1.000}}$ |
-| Contrastive policies                             | 0.900                           | 0.963                           | $\color{green}{\textbf{1.000}}$ |
-| MMLU-Pro (10-way)                                | 0.515                           | $\color{green}{\textbf{0.840}}$ | 0.739                           |
-| Buried state                                     | 0.740                           | 0.700                           | $\color{green}{\textbf{0.759}}$ |
-| Unknowable answered at p ≥ 0.9 (lower is better) | $\color{green}{\textbf{0.000}}$ | 0.090                           | 0.055                           |
-| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | $\color{green}{\textbf{0.865}}$ |
-| JevBench ECE (public items)                      |                                 | 0.049                           | $\color{green}{\textbf{0.037}}$ |
+| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                           | 0.857                           | $\color{green}{\textsf{\textbf{0.889}}}$ |
+| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | $\color{green}{\textsf{\textbf{0.800}}}$ | 0.746                           |
+| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | $\color{green}{\textsf{\textbf{0.935}}}$ |
+| QNLI                                             | $\color{green}{\textsf{\textbf{0.925}}}$ | $\color{green}{\textsf{\textbf{0.925}}}$ | 0.913                           |
+| SciQ                                             | 0.963                           | 0.988                           | $\color{green}{\textsf{\textbf{0.991}}}$ |
+| TweetEval offensive                              | 0.775                           | $\color{green}{\textsf{\textbf{0.813}}}$ | $\color{green}{\textsf{\textbf{0.813}}}$ |
+| PAWS                                             | 0.763                           | 0.788                           | $\color{green}{\textsf{\textbf{0.875}}}$ |
+| MMLU                                             | 0.738                           | $\color{green}{\textsf{\textbf{0.900}}}$ | 0.793                           |
+| Emotion                                          | 0.600                           | 0.588                           | $\color{green}{\textsf{\textbf{0.647}}}$ |
+| Held-out rule structures                         | 0.896                           | 0.885                           | $\color{green}{\textsf{\textbf{1.000}}}$ |
+| Contrastive policies                             | 0.900                           | 0.963                           | $\color{green}{\textsf{\textbf{1.000}}}$ |
+| MMLU-Pro (10-way)                                | 0.515                           | $\color{green}{\textsf{\textbf{0.840}}}$ | 0.739                           |
+| Buried state                                     | 0.740                           | 0.700                           | $\color{green}{\textsf{\textbf{0.759}}}$ |
+| Unknowable answered at p ≥ 0.9 (lower is better) | $\color{green}{\textsf{\textbf{0.000}}}$ | 0.090                           | 0.055                           |
+| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | $\color{green}{\textsf{\textbf{0.865}}}$ |
+| JevBench ECE (public items)                      |                                 | 0.049                           | $\color{green}{\textsf{\textbf{0.037}}}$ |
 
 \* No Kev-9B JevBench result is published; these are Kev-8B (Qwen3).
 
