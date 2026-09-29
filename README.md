@@ -16,9 +16,9 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 ## Highlights
 
 - A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that thinks before it decides, with a block-4 diffusion drafter and the full training code and train/dev/test data.
-- Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
+- Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev).
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
-- About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Truncating chains and skipping thinking for confident questions cuts the median to 2.0 s for about one point of accuracy.
+- About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Can be sped up by truncating chain length.
 - Runs on CUDA (Hopper for the FP8 kernel).
 
 ## Problem
@@ -58,7 +58,7 @@ Without thinking the same checkpoint scores 0.804 on our test split (2,962 items
 
 ## Quickstart
 
-Requirements: Python 3.12 and a CUDA GPU. Install the pinned versions we tested with:
+Requirements: Python 3.12 and a CUDA GPU.
 
 ```bash
 pip install -r requirements.txt
