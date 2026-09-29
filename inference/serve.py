@@ -88,7 +88,7 @@ def main() -> None:
     defaults = Options(max_think=a.max_think, nothink_threshold=a.nothink_threshold)
     warm = DataFormat(state="warmup", questions=[Question(id="q", type="noul", instructions="Is this a warmup?")])
     engine.answer(warm, Options(max_think=16))
-    info = {"model": a.model, "drafter": a.drafter, "block": a.block, "fp8": a.fp8}
+    info = {"model": a.model, "drafter": a.drafter, "block": a.block, "fp8": engine.fp8}
     httpd = ThreadingHTTPServer((a.host, a.port), handler(Server(engine, defaults, info)))
     print(json.dumps({"serving": f"http://{a.host}:{a.port}", **info}), flush=True)
     httpd.serve_forever()

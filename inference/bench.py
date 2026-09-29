@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
     n = len(rows)
     lat_sorted = sorted(lat)
     thought = [r for r in rows if r["thought"]]
-    summary = {"fp8": a.fp8, "block": a.block, "records": len(records), "questions": n, "acc": sum(r["ok"] for r in rows) / n,
+    summary = {"fp8": engine.fp8, "block": a.block, "records": len(records), "questions": n, "acc": sum(r["ok"] for r in rows) / n,
                "nll": -sum(torch.tensor(max(r["p_label"], 1e-9)).log().item() for r in rows) / n,
                "thought_frac": len(thought) / n, "closed_frac_of_thought": sum(r["closed"] for r in thought) / max(1, len(thought)),
                "mean_chain_tokens": sum(r["tokens"] for r in rows) / n,

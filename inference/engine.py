@@ -42,6 +42,7 @@ class Engine:
             raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
         view.requires_grad_(False)
         self.dtype = base.lm_head.weight.dtype
+        fp8 = fp8 and torch.cuda.get_device_capability(dev) >= (8, 9)
         if fp8:
             quantize(view)
             warm(view)
