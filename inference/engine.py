@@ -11,7 +11,7 @@ from inference.fp8 import quantize, warm
 from inference.types import Options, Result
 from model.config import LINEAR
 from model.model import apply_rotary, gated_delta_rule_chunk
-from orthrus.view import OrthrusView
+from drafter.view import OrthrusView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]

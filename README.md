@@ -32,24 +32,24 @@ This results in better performance on out of domain tasks, and outperforms Jev i
 
 Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise. The best result in each row is in bold and underlined.
 
-| bench                                            | Kev-9B                          | Jev                             | Jeeves                          |
-| ------------------------------------------------ | ------------------------------- | ------------------------------- | ------------------------------- |
-| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                           | 0.857                           | <ins><b>0.889</b></ins> |
-| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | <ins><b>0.800</b></ins> | 0.746                           |
-| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | <ins><b>0.935</b></ins> |
-| QNLI                                             | <ins><b>0.925</b></ins> | <ins><b>0.925</b></ins> | 0.913                           |
-| SciQ                                             | 0.963                           | 0.988                           | <ins><b>0.991</b></ins> |
-| TweetEval offensive                              | 0.775                           | <ins><b>0.813</b></ins> | <ins><b>0.813</b></ins> |
-| PAWS                                             | 0.763                           | 0.788                           | <ins><b>0.875</b></ins> |
-| MMLU                                             | 0.738                           | <ins><b>0.900</b></ins> | 0.793                           |
-| Emotion                                          | 0.600                           | 0.588                           | <ins><b>0.647</b></ins> |
-| Held-out rule structures                         | 0.896                           | 0.885                           | <ins><b>1.000</b></ins> |
-| Contrastive policies                             | 0.900                           | 0.963                           | <ins><b>1.000</b></ins> |
-| MMLU-Pro (10-way)                                | 0.515                           | <ins><b>0.840</b></ins> | 0.739                           |
-| Buried state                                     | 0.740                           | 0.700                           | <ins><b>0.759</b></ins> |
-| Unknowable answered at p ≥ 0.9 (lower is better) | <ins><b>0.000</b></ins> | 0.090                           | 0.055                           |
-| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | <ins><b>0.865</b></ins> |
-| JevBench ECE (public items)                      |                                 | 0.049                           | <ins><b>0.037</b></ins> |
+| bench                                                        | Kev-9B                  | Jev                     | Jeeves                  |
+| ------------------------------------------------------------ | ----------------------- | ----------------------- | ----------------------- |
+| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                   | 0.857                   | <ins><b>0.889</b></ins> |
+| **Transfer overall** (MMLU-Pro and buried state)             | 0.579                   | <ins><b>0.800</b></ins> | 0.746                   |
+| **JevBench overall** (231 public items)                      | 0.715\*                 | 0.866                   | <ins><b>0.935</b></ins> |
+| QNLI                                                         | <ins><b>0.925</b></ins> | <ins><b>0.925</b></ins> | 0.913                   |
+| SciQ                                                         | 0.963                   | 0.988                   | <ins><b>0.991</b></ins> |
+| TweetEval offensive                                          | 0.775                   | <ins><b>0.813</b></ins> | <ins><b>0.813</b></ins> |
+| PAWS                                                         | 0.763                   | 0.788                   | <ins><b>0.875</b></ins> |
+| MMLU                                                         | 0.738                   | <ins><b>0.900</b></ins> | 0.793                   |
+| Emotion                                                      | 0.600                   | 0.588                   | <ins><b>0.647</b></ins> |
+| Held-out rule structures                                     | 0.896                   | 0.885                   | <ins><b>1.000</b></ins> |
+| Contrastive policies                                         | 0.900                   | 0.963                   | <ins><b>1.000</b></ins> |
+| MMLU-Pro (10-way)                                            | 0.515                   | <ins><b>0.840</b></ins> | 0.739                   |
+| Buried state                                                 | 0.740                   | 0.700                   | <ins><b>0.759</b></ins> |
+| Unknowable answered at p ≥ 0.9 (lower is better)             | <ins><b>0.000</b></ins> | 0.090                   | 0.055                   |
+| JevBench hard (111 public items)                             | 0.451\*                 | 0.730                   | <ins><b>0.865</b></ins> |
+| JevBench ECE (public items)                                  |                         | 0.049                   | <ins><b>0.037</b></ins> |
 
 \* No Kev-9B JevBench result is published; these are Kev-8B (Qwen3).
 
@@ -188,6 +188,7 @@ A pointer head scores each option with a scaled dot product between a query proj
 ```
 
 These are rare, largely unused tokens in the Qwen tokenizer. Ablations found that using plain text like "State" in the prompt instead worsened performance.
+Likewise, not repeating the questions after the reasoning block also decreases performance.
 The final probabilities are a softmax over the option scores, divided by a temperature fitted on the dev set.
 
 ### Training
@@ -198,9 +199,11 @@ The final probabilities are a softmax over the option scores, divided by a tempe
 
 Stopping at step 402 keeps the best calibration and JevBench score; past it, the head over-sharpens on the saturated RL pool.
 
-### Drafter
+### Diffusion drafter
 
-The Orthrus drafter is a diffusion view of the same frozen model: extra query/key/value projections that let masked positions read the verified context and predict the next 3 tokens in one pass. It is distilled by KL divergence from the policy on 349k chains sampled from the trained model. Each decode cycle verifies the drafted tokens and drafts the next block in the same forward pass, so output matches greedy decoding up to numerical noise.
+A diffusion view of the frozen model (`drafter/`), inspired by [Orthrus](https://arxiv.org/abs/2605.12825).
+
+Unlike Orthrus, which supports attention-only models, it supports Qwen3.5's Gated DeltaNet layers by letting mask tokens cross-attend to those layers' post-convolution keys and values.
 
 |                                             | chain tokens per second |
 | ------------------------------------------- | ----------------------- |
@@ -217,7 +220,19 @@ Block 4 is the default because it stays cheap when several questions are batched
 
 ## Reproduce
 
-On 8 GPUs, with the data in `data/`, `bash run.sh` runs the whole pipeline (set `NPROC` for a different GPU count). Its steps are:
+### Data
+
+You can build the datasets locally using the prep scripts. This downloads the public datasets from Hugging Face at the revisions pinned in `prep/public.py`:
+
+```bash
+python -m prep.prep
+```
+
+Each public dataset stays under its own license.
+
+### Training
+
+On 8 GPUs, with the data in `data/`, `bash run.sh` runs the whole pipeline:
 
 ```bash
 torchrun --nproc_per_node 8 train.py sft --run-dir runs/sft
@@ -225,11 +240,9 @@ torchrun --nproc_per_node 8 train.py cispo --run-dir runs/cispo --init runs/sft/
 torchrun --nproc_per_node 8 test.py runs/cispo/final
 torchrun --nproc_per_node 8 jevbench.py runs/cispo/final
 python export.py runs/cispo/final --out runs/fused
-torchrun --nproc_per_node 8 -m orthrus.gen --model runs/fused
+torchrun --nproc_per_node 8 -m drafter.gen --model runs/fused
 torchrun --nproc_per_node 8 train.py orthrus --model runs/fused --block 4 --run-dir runs/orthrus_k4
 ```
-
-A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, and matched the published checkpoint within noise (test thinking 0.851 vs 0.840, JevBench hard 0.838 vs 0.865).
 
 ## Repository
 
@@ -241,7 +254,7 @@ A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, a
 | `trainer.py`, `train.py`                 | SFT, CISPO and drafter training                                                     |
 | `test.py`, `jevbench.py`, `calibrate.py` | evaluation, JevBench, temperature fitting                                           |
 | `export.py`                              | fuses LoRA into a standalone model with the head and temperature                    |
-| `orthrus/`                               | drafter model, chain sampling, fused speculative decoder                            |
+| `drafter/`                               | drafter model, chain sampling, fused speculative decoder                            |
 | `inference/`                             | FP8 kernel, batched speculative engine, Jev-compatible server and benchmark         |
 | `sdk/`                                   | `jeeves_sdk`, a drop-in replacement for Jev's Python SDK with the reasoning options |
 
@@ -290,6 +303,7 @@ Drafting and inference
 
 - Leviathan, Kalman, Matias. [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192). ICML 2023.
 - Chen et al. [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318). 2023.
+- [Orthrus](https://arxiv.org/abs/2605.12825), arXiv 2605.12825. The diffusion-drafter design ours adapts to Gated DeltaNet.
 - Stern, Shazeer, Uszkoreit. [Blockwise Parallel Decoding for Deep Autoregressive Models](https://arxiv.org/abs/1811.03115). NeurIPS 2018.
 - Cai et al. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774). ICML 2024.
 - Zhou et al. [DistillSpec: Improving Speculative Decoding via Knowledge Distillation](https://arxiv.org/abs/2310.08461). ICLR 2024.

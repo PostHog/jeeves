@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import fields
 
-from orthrus.train import OrthrusConfig, train_orthrus
+from drafter.train import OrthrusConfig, train_orthrus
 from trainer import Config, run
 
 STAGES = {"sft": Config, "cispo": Config, "orthrus": OrthrusConfig}

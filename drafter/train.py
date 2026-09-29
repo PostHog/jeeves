@@ -13,8 +13,8 @@ from safetensors.torch import load_file, save_file
 from loader.dataloader import Encoder
 from metrics import Metrics
 from model import Qwen3_5ForCausalLM
-from orthrus.data import Batches, load_streams, pack
-from orthrus.view import OrthrusView, build_anchor_layout
+from drafter.data import Batches, load_streams, pack
+from drafter.view import OrthrusView, build_anchor_layout
 from distributed import all_reduce_grads, setup_distributed
 
 
