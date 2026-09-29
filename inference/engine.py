@@ -10,7 +10,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from export import load_export
 from inference.types import Options, Result
 from model.config import LINEAR
-from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step
+from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, torch_recurrent_gated_delta_rule_states
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -90,6 +90,7 @@ class Engine:
         self.ar_k = torch.arange(K, device=dev)
         self.ar_j = torch.arange(J, device=dev)
         self.ar_l = torch.arange(max_len + 1, device=dev)
+        self.ar_r = torch.arange(max_rows, device=dev)
         block_of_mask = torch.arange(K, device=dev).repeat_interleave(J)
         self.mask_offset = block_of_mask + (self.ar_j + 1).repeat(K)
         self.limit_offset = torch.cat((self.ar_k, block_of_mask))
@@ -99,6 +100,16 @@ class Engine:
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
         # MPS runs the full-vocabulary matmul about 3x slower than the same matmul in 8 row chunks, which give bitwise-equal logits.
         self.lm_head_chunks = base.lm_head.weight.chunk(8) if dev.type == "mps" else None
+
+    def delta_forward(self, q, k, v, g, beta, state) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.device.type == "cuda":
+            return delta_step(q, k, v, g, beta, state, False)
+        return torch_recurrent_gated_delta_rule_states(q, k, v, g, beta, state)
+
+    def delta_commit(self, k, v, g, beta, states, state, keep, accepted) -> torch.Tensor:
+        if states is None:
+            return delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1]
+        return states[self.ar_r[:len(accepted)], accepted]
 
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
         if self.lm_head_chunks is None:
@@ -198,8 +209,8 @@ class Engine:
                 v = v.reshape(B, K, Hv, Dv)
                 beta = lin.in_proj_b(hc).sigmoid()
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(hc).float() + lin.dt_bias)
-                o_c, _ = delta_step(q, k, v, g, beta, self.rec[i][:B], False)
-                pending[i] = (k, v, g, beta, ext)
+                o_c, states = self.delta_forward(q, k, v, g, beta, self.rec[i][:B])
+                pending[i] = (k, v, g, beta, ext, states)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos[:, :K], sin[:, :K])
                 self.dv[i][rows, pos_c] = v
                 qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos[:, K:], sin[:, K:])
@@ -248,9 +259,8 @@ class Engine:
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
         keep = (self.ar_k[None] < j[:, None]).float()[..., None]
-        for i, (k, v, g, beta, ext) in pending.items():
-            _, state = delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), self.rec[i][:B], True)
-            self.rec[i][:B].copy_(state)
+        for i, (k, v, g, beta, ext, states) in pending.items():
+            self.rec[i][:B].copy_(self.delta_commit(k, v, g, beta, states, self.rec[i][:B], keep, j))
             idx = (j[:, None] + torch.arange(ext.shape[-1] - K, device=self.device)[None])[:, None, :].expand(B, ext.shape[1], -1)
             self.conv[i][:B].copy_(ext.gather(2, idx))
         cand.copy_(torch.where(done[:, None], cand, nxt))
