@@ -177,7 +177,7 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + eps)
 
 
-def _torch_recurrent_states(q, k, v, g, beta, initial_state, keep_all_states: bool):
+def torch_recurrent_gated_delta_rule(q, k, v, g, beta, initial_state=None, output_final_state=False):
     dtype = q.dtype
     q, k = _l2norm(q.float()), _l2norm(k.float())
     v, g, beta = v.float(), g.float(), beta.float()
@@ -186,7 +186,7 @@ def _torch_recurrent_states(q, k, v, g, beta, initial_state, keep_all_states: bo
     q = q * Dk**-0.5
     S = torch.zeros(B, H, Dk, Dv, dtype=torch.float32, device=q.device) if initial_state is None \
         else initial_state.to(torch.float32)
-    outs, states = [], [S]
+    outs = []
     for t in range(T):
         S = S * g[:, t].exp()[..., None, None]
         k_t, v_t, q_t = k[:, t], v[:, t], q[:, t]
@@ -194,18 +194,8 @@ def _torch_recurrent_states(q, k, v, g, beta, initial_state, keep_all_states: bo
         delta = beta[:, t, :, None] * (v_t - retrieved)
         S = S + torch.einsum("bhk,bhv->bhkv", k_t, delta)
         outs.append(torch.einsum("bhk,bhkv->bhv", q_t, S))
-        states = states + [S] if keep_all_states else [S]
-    return torch.stack(outs, dim=1).to(dtype), states
-
-
-def torch_recurrent_gated_delta_rule(q, k, v, g, beta, initial_state=None, output_final_state=False):
-    out, states = _torch_recurrent_states(q, k, v, g, beta, initial_state, keep_all_states=False)
-    return out, (states[-1] if output_final_state else None)
-
-
-def torch_recurrent_gated_delta_rule_states(q, k, v, g, beta, initial_state=None):
-    out, states = _torch_recurrent_states(q, k, v, g, beta, initial_state, keep_all_states=True)
-    return out, torch.stack(states, dim=1)
+    out = torch.stack(outs, dim=1)
+    return out.to(dtype), (S if output_final_state else None)
 
 
 def torch_chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=64, initial_state=None, output_final_state=False):
