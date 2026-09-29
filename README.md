@@ -16,7 +16,7 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 ## Highlights
 
 - A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that thinks before it decides, with a block-4 diffusion drafter and the full training code and train/dev/test data.
-- Beats Kev-9B and Jev on out-of-domain accuracy (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
+- Beats Kev-9B and Jev on data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
 - Calibrated out of the box: a fitted temperature brings top-label calibration error to 0.021 and confident errors (wrong at p ≥ 0.9) to 1.3% of answers.
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
 - About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Truncating chains and skipping thinking for confident questions cuts the median to 2.0 s for about one point of accuracy.
@@ -30,26 +30,26 @@ This results in better performance on out of domain tasks, and outperforms Jev i
 
 ## Results
 
-Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise.
+Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise. The best result in each row is in green.
 
-| bench                                            | Kev-9B    | Jev       | Jeeves    |
-| ------------------------------------------------ | --------- | --------- | --------- |
-| **Out-of-domain overall** (item-weighted)        | 0.822     | 0.857     | **0.889** |
-| **Transfer overall** (MMLU-Pro and buried state) | 0.579     | **0.800** | 0.746     |
-| **JevBench overall** (231 public items)          | 0.715\*   | 0.866     | **0.935** |
-| QNLI                                             | **0.925** | **0.925** | 0.913     |
-| SciQ                                             | 0.963     | 0.988     | **0.991** |
-| TweetEval offensive                              | 0.775     | **0.813** | **0.813** |
-| PAWS                                             | 0.763     | 0.788     | **0.875** |
-| MMLU                                             | 0.738     | **0.900** | 0.793     |
-| Emotion                                          | 0.600     | 0.588     | **0.647** |
-| Held-out rule structures                         | 0.896     | 0.885     | **1.000** |
-| Contrastive policies                             | 0.900     | 0.963     | **1.000** |
-| MMLU-Pro (10-way)                                | 0.515     | **0.840** | 0.739     |
-| Buried state                                     | 0.740     | 0.700     | **0.759** |
-| Unknowable answered at p ≥ 0.9 (lower is better) | **0.000** | 0.090     | 0.055     |
-| JevBench hard (111 public items)                 | 0.451\*   | 0.730     | **0.865** |
-| JevBench ECE (public items)                      |           | 0.049     | **0.037** |
+| bench                                            | Kev-9B                          | Jev                             | Jeeves                          |
+| ------------------------------------------------ | ------------------------------- | ------------------------------- | ------------------------------- |
+| **Out-of-domain overall** (item-weighted)        | 0.822                           | 0.857                           | $\color{green}{\textbf{0.889}}$ |
+| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | $\color{green}{\textbf{0.800}}$ | 0.746                           |
+| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | $\color{green}{\textbf{0.935}}$ |
+| QNLI                                             | $\color{green}{\textbf{0.925}}$ | $\color{green}{\textbf{0.925}}$ | 0.913                           |
+| SciQ                                             | 0.963                           | 0.988                           | $\color{green}{\textbf{0.991}}$ |
+| TweetEval offensive                              | 0.775                           | $\color{green}{\textbf{0.813}}$ | $\color{green}{\textbf{0.813}}$ |
+| PAWS                                             | 0.763                           | 0.788                           | $\color{green}{\textbf{0.875}}$ |
+| MMLU                                             | 0.738                           | $\color{green}{\textbf{0.900}}$ | 0.793                           |
+| Emotion                                          | 0.600                           | 0.588                           | $\color{green}{\textbf{0.647}}$ |
+| Held-out rule structures                         | 0.896                           | 0.885                           | $\color{green}{\textbf{1.000}}$ |
+| Contrastive policies                             | 0.900                           | 0.963                           | $\color{green}{\textbf{1.000}}$ |
+| MMLU-Pro (10-way)                                | 0.515                           | $\color{green}{\textbf{0.840}}$ | 0.739                           |
+| Buried state                                     | 0.740                           | 0.700                           | $\color{green}{\textbf{0.759}}$ |
+| Unknowable answered at p ≥ 0.9 (lower is better) | $\color{green}{\textbf{0.000}}$ | 0.090                           | 0.055                           |
+| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | $\color{green}{\textbf{0.865}}$ |
+| JevBench ECE (public items)                      |                                 | 0.049                           | $\color{green}{\textbf{0.037}}$ |
 
 \* No Kev-9B JevBench result is published; these are Kev-8B (Qwen3).
 
@@ -233,17 +233,17 @@ A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, a
 
 ## Repository
 
-| path                                                 | contents                                                                            |
-| ---------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `model/`                                             | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head                      |
-| `loader/`                                            | prompt format, tokenisation and batching                                            |
-| `prep/`                                              | dataset construction (`prep.py`) and synthetic generators                           |
-| `trainer.py`, `train.py`                             | SFT, CISPO and drafter training                                                     |
-| `test.py`, `jevbench.py`, `calibrate.py`                 | evaluation, JevBench, temperature fitting                                           |
-| `export.py`                                          | fuses LoRA into a standalone model with the head and temperature                    |
-| `orthrus/`                                           | drafter model, chain sampling, fused speculative decoder                            |
-| `inference/`                                         | FP8 kernel, batched speculative engine, Jev-compatible server and benchmark         |
-| `sdk/`                                               | `jeeves_sdk`, a drop-in replacement for Jev's Python SDK with the reasoning options |
+| path                                     | contents                                                                            |
+| ---------------------------------------- | ----------------------------------------------------------------------------------- |
+| `model/`                                 | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head                      |
+| `loader/`                                | prompt format, tokenisation and batching                                            |
+| `prep/`                                  | dataset construction (`prep.py`) and synthetic generators                           |
+| `trainer.py`, `train.py`                 | SFT, CISPO and drafter training                                                     |
+| `test.py`, `jevbench.py`, `calibrate.py` | evaluation, JevBench, temperature fitting                                           |
+| `export.py`                              | fuses LoRA into a standalone model with the head and temperature                    |
+| `orthrus/`                               | drafter model, chain sampling, fused speculative decoder                            |
+| `inference/`                             | FP8 kernel, batched speculative engine, Jev-compatible server and benchmark         |
+| `sdk/`                                   | `jeeves_sdk`, a drop-in replacement for Jev's Python SDK with the reasoning options |
 
 ## Limitations
 
