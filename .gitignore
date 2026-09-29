@@ -1,0 +1,12 @@
+__pycache__/
+.DS_Store
+.venv/
+data/*
+.scratch/
+!data/manifest.json
+checkpoints/
+runs/
+kev/
+BEST.md
+loop.py
+sweep.py
