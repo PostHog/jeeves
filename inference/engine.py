@@ -102,6 +102,15 @@ class Engine:
         # MPS runs the full-vocabulary matmul about 3x slower than the same matmul in 8 row chunks, which give bitwise-equal logits.
         self.lm_head_chunks = base.lm_head.weight.chunk(8) if dev.type == "mps" else None
 
+    def delta_prefill(self, q, k, v, g, beta, state, commit: bool) -> torch.Tensor:
+        if self.device.type == "cuda":
+            o, final = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=state, output_final_state=True)
+            if commit:
+                state.copy_(final)
+            return o
+        steps = torch.full((q.shape[0],), q.shape[1], dtype=torch.long, device=q.device)
+        return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, steps, advance_state=commit)
+
     def delta_forward(self, q, k, v, g, beta, state) -> torch.Tensor:
         if self.device.type == "cuda":
             return delta_step(q, k, v, g, beta, state, False)[0]
@@ -156,9 +165,8 @@ class Engine:
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
                 beta = lin.in_proj_b(h).sigmoid() * keep.to(h.dtype)
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(h).float() + lin.dt_bias) * keep
-                o, state = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=self.rec[i][:B], output_final_state=True)
+                o = self.delta_prefill(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
-                    self.rec[i][:B].copy_(state)
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
                     self.conv[i][:B].copy_(ext.gather(2, idx))
                 self.dk[i][rows, wpos] = apply_rotary(k, cos, sin)

@@ -84,9 +84,9 @@ def _run(q, k, v, g, beta, state, out, steps, write_state: bool, write_out: bool
                                steps, T, H, int(write_state), int(write_out), threads=(32 * DV // BV, H, B), group_size=(32, 1, 1))
 
 
-def gated_delta_rule_outputs(q, k, v, g, beta, state, steps) -> torch.Tensor:
+def gated_delta_rule_outputs(q, k, v, g, beta, state, steps, advance_state: bool = False) -> torch.Tensor:
     out = torch.empty(v.shape, dtype=torch.bfloat16, device=v.device)
-    _run(q, k, v, g, beta, state, out, steps, write_state=False, write_out=True)
+    _run(q, k, v, g, beta, state, out, steps, write_state=advance_state, write_out=True)
     return out
 
 
