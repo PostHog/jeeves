@@ -77,6 +77,8 @@ On a Mac, the engine runs in bf16 on MPS. The weights use 21 GB. The default cac
 python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafter_k4.safetensors --max-rows 4 --max-len 4096 --port 8009
 ```
 
+On an M4 Pro, one question thinks at about 19 tokens per second, and a request without thinking takes 0.3 to 0.5 s. `python -m model.metal_test` checks the Metal kernels against float64 and eager references, and `python speed.py --data data/dev.jsonl` times a fixed set of dev requests.
+
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 
 ```bash
