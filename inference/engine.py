@@ -320,7 +320,8 @@ class Engine:
 
     @torch.no_grad()
     def decode(self, B: int, prompts: list[list[int]], first: torch.Tensor, caps: list[int]) -> tuple[list[list[int]], list[bool]]:
-        Bp = self.bucket(B)
+        # Rounding the rows up to a power of two keeps CUDA to a few graph shapes. Without graphs the padding rows are wasted compute.
+        Bp = self.bucket(B) if self.device.type == "cuda" else B
         dev = self.device
         self.n[:Bp].zero_()
         self.n[:B].copy_(torch.tensor([len(p) for p in prompts], device=dev))
