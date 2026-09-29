@@ -7,6 +7,10 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = ["typesafe-sdk>=0.7.2,<0.8"]
 
+[project.urls]
+Homepage = "https://github.com/PostHog/jeeves"
+Repository = "https://github.com/PostHog/jeeves"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

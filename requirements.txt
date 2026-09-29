@@ -1,0 +1,8 @@
+torch==2.14.0
+triton==3.8.0
+flash-linear-attention==0.5.2
+transformers==5.17.0
+tokenizers==0.23.2
+safetensors==0.8.0
+huggingface_hub==1.32.0
+datasets>=3.0

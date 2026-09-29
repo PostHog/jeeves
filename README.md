@@ -6,7 +6,6 @@ A reasoning Jev-style classifier with a diffusion drafter, trained with SFT and 
 
 <p>
   <a href="https://huggingface.co/collections/"><img alt="Weights: 9B" src="https://img.shields.io/badge/WEIGHTS-9B-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
-  <a href="https://huggingface.co/datasets/"><img alt="Frozen eval suites" src="https://img.shields.io/badge/EVAL%20SUITES-frozen-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
 </p>
 
@@ -60,7 +59,11 @@ Without thinking the same checkpoint scores 0.804 on our test split (2,962 items
 
 ## Quickstart
 
-Requirements: Python 3.12, PyTorch with CUDA (tested with 2.14), `triton`, `flash-linear-attention`, `transformers`, `safetensors` and `huggingface_hub`.
+Requirements: Python 3.12 and a CUDA GPU. Install the pinned versions we tested with:
+
+```bash
+pip install -r requirements.txt
+```
 
 Fuse a trained checkpoint into a standalone model and serve it with a drafter:
 
@@ -226,7 +229,7 @@ torchrun --nproc_per_node 8 -m orthrus.gen --model runs/fused
 torchrun --nproc_per_node 8 train.py orthrus --model runs/fused --block 4 --run-dir runs/orthrus_k4
 ```
 
-A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, and matched the published checkpoint within noise (test thinking 0.851 vs 0.840, JevBench hard 0.838 vs 0.865). `BEST.md` has the full recipe, data hashes and both runs side by side.
+A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, and matched the published checkpoint within noise (test thinking 0.851 vs 0.840, JevBench hard 0.838 vs 0.865).
 
 ## Repository
 
@@ -236,7 +239,7 @@ A from-scratch run on 8×H100 took 33 minutes for SFT and 8.2 hours for CISPO, a
 | `loader/`                                            | prompt format, tokenisation and batching                                            |
 | `prep/`                                              | dataset construction (`prep.py`) and synthetic generators                           |
 | `trainer.py`, `train.py`                             | SFT, CISPO and drafter training                                                     |
-| `test.py`, `jevbench.py`, `calibrate.py`, `sweep.py` | evaluation, JevBench, temperature fitting, truncation and routing sweep             |
+| `test.py`, `jevbench.py`, `calibrate.py`                 | evaluation, JevBench, temperature fitting                                           |
 | `export.py`                                          | fuses LoRA into a standalone model with the head and temperature                    |
 | `orthrus/`                                           | drafter model, chain sampling, fused speculative decoder                            |
 | `inference/`                                         | FP8 kernel, batched speculative engine, Jev-compatible server and benchmark         |
@@ -259,6 +262,7 @@ If you use Jeeves, its training recipe or its drafter, please cite:
   author = {Waltz, Nicholas P.},
   title  = {Jeeves: Reasoning Improves Jev-like Decisions},
   year   = {2026},
+  url    = {https://github.com/PostHog/jeeves},
   note   = {Qwen3.5-9B decision model trained with SFT and CISPO, with a block-4 diffusion drafter}
 }
 ```
