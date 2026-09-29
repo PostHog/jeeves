@@ -33,7 +33,7 @@ def common_prefix(seqs: list[list[int]]) -> int:
 
 class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
-                 window_step: int = 512, sync_every: int = 4, device: str | None = None):
+                 window_step: int = 512, sync_every: int | None = None, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
@@ -61,7 +61,8 @@ class Engine:
         self.R, self.L = max_rows, max_len
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
-        self.window_step, self.sync_every = window_step, sync_every
+        # Without CUDA graphs a host sync is cheap, and each unneeded cycle after the last row finishes costs a full forward.
+        self.window_step, self.sync_every = window_step, sync_every or (4 if dev.type == "cuda" else 1)
         self.eos = encoder.think_end_id
         self.pad = encoder.pad_id
         self.opt_end = encoder.opt_end_id
