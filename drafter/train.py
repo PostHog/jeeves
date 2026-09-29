@@ -20,7 +20,7 @@ from distributed import all_reduce_grads, setup_distributed
 
 @dataclass
 class OrthrusConfig:
-    run_dir: str = "runs/orthrus_k8"
+    run_dir: str = "runs/drafter_k8"
     model: str = "runs/fused"
     tokenizer: str = "Qwen/Qwen3.5-9B"
     chains: str = "data/chains_402/chains.rank*.jsonl"
@@ -111,9 +111,9 @@ def train_orthrus(a: OrthrusConfig) -> None:
                 t0 = time.time()
                 tokens_seen = 0
     if rank == 0:
-        save_file({k: v.detach().contiguous().cpu() for k, v in view.state_dict().items() if not k.startswith("base.")}, str(out / "orthrus.safetensors"))
+        save_file({k: v.detach().contiguous().cpu() for k, v in view.state_dict().items() if not k.startswith("base.")}, str(out / "drafter.safetensors"))
         (out / "config.json").write_text(json.dumps(asdict(a), indent=2) + "\n")
-        print("saved", out / "orthrus.safetensors")
+        print("saved", out / "drafter.safetensors")
     if world > 1:
         dist.barrier()
         dist.destroy_process_group()

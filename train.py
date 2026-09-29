@@ -6,7 +6,7 @@ from dataclasses import fields
 from drafter.train import OrthrusConfig, train_orthrus
 from trainer import Config, run
 
-STAGES = {"sft": Config, "cispo": Config, "orthrus": OrthrusConfig}
+STAGES = {"sft": Config, "cispo": Config, "drafter": OrthrusConfig}
 
 
 def add_fields(ap: argparse.ArgumentParser, cls) -> None:
@@ -23,13 +23,13 @@ def add_fields(ap: argparse.ArgumentParser, cls) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SFT and CISPO for the Qwen3.5 pointer-decision model, then Orthrus drafter distillation.")
+    ap = argparse.ArgumentParser(description="SFT and CISPO for the Qwen3.5 pointer-decision model, then diffusion drafter distillation.")
     sub = ap.add_subparsers(dest="stage", required=True)
     for stage, cls in STAGES.items():
         add_fields(sub.add_parser(stage), cls)
     args = vars(ap.parse_args())
     stage = args.pop("stage")
-    if stage == "orthrus":
+    if stage == "drafter":
         train_orthrus(OrthrusConfig(**args))
     else:
         run(Config(stage=stage, **args))

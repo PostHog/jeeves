@@ -5,7 +5,7 @@ A reasoning Jev-style classifier with a diffusion drafter, trained with SFT and 
 <img src="assets/smug.png" alt="Jeeves" width="220">
 
 <p>
-  <a href="https://huggingface.co/collections/"><img alt="Weights: 9B" src="https://img.shields.io/badge/WEIGHTS-9B-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
+  <a href="https://huggingface.co/PostHog/jeeves"><img alt="Weights: 9B" src="https://img.shields.io/badge/WEIGHTS-9B-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
 </p>
 
@@ -65,11 +65,18 @@ Requirements: Python 3.12 and a CUDA GPU. Install the pinned versions we tested 
 pip install -r requirements.txt
 ```
 
-Fuse a trained checkpoint into a standalone model and serve it with a drafter:
+Download the released weights and serve them:
+
+```bash
+hf download PostHog/jeeves --local-dir jeeves-weights
+python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafter_k4.safetensors --port 8009
+```
+
+Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 
 ```bash
 python export.py runs/cispo/final --out runs/fused
-python -m inference.serve --model runs/fused --drafter runs/orthrus_k4/orthrus.safetensors --port 8009
+python -m inference.serve --model runs/fused --drafter runs/drafter_k4/drafter.safetensors --port 8009
 ```
 
 Then send a request in Jev's format:
@@ -241,7 +248,7 @@ torchrun --nproc_per_node 8 test.py runs/cispo/final
 torchrun --nproc_per_node 8 jevbench.py runs/cispo/final
 python export.py runs/cispo/final --out runs/fused
 torchrun --nproc_per_node 8 -m drafter.gen --model runs/fused
-torchrun --nproc_per_node 8 train.py orthrus --model runs/fused --block 4 --run-dir runs/orthrus_k4
+torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-dir runs/drafter_k4
 ```
 
 ## Repository

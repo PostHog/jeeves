@@ -10,4 +10,4 @@ $TR test.py runs/cispo/final
 $TR jevbench.py runs/cispo/final
 python export.py runs/cispo/final --out runs/fused
 $TR -m drafter.gen --model runs/fused
-$TR train.py orthrus --model runs/fused --block 4 --run-dir runs/orthrus_k4
+$TR train.py drafter --model runs/fused --block 4 --run-dir runs/drafter_k4

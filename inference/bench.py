@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Accuracy and latency of the inference engine on a labelled split.")
     ap.add_argument("--model", default="runs/fused")
-    ap.add_argument("--drafter", default="runs/orthrus_k4/orthrus.safetensors")
+    ap.add_argument("--drafter", default="runs/drafter_k4/drafter.safetensors")
     ap.add_argument("--block", type=int, default=4)
     ap.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--data", default="data/dev.jsonl")
