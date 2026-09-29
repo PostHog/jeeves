@@ -17,7 +17,6 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 
 - A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that thinks before it decides, with a block-4 diffusion drafter and the full training code and train/dev/test data.
 - Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev). Knowledge-heavy benchmarks are the exception: MMLU-Pro is 0.739, against Kev-9B's 0.515 and Jev's 0.840.
-- Calibrated out of the box: a fitted temperature brings top-label calibration error to 0.021 and confident errors (wrong at p ≥ 0.9) to 1.3% of answers.
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
 - About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Truncating chains and skipping thinking for confident questions cuts the median to 2.0 s for about one point of accuracy.
 - Runs on CUDA (Hopper for the FP8 kernel).
