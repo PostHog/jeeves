@@ -14,12 +14,12 @@ from loader.dataloader import Encoder
 from metrics import Metrics
 from model import Qwen3_5ForCausalLM
 from drafter.data import Batches, load_streams, pack
-from drafter.view import OrthrusView, build_anchor_layout
+from drafter.view import DrafterView, build_anchor_layout
 from distributed import all_reduce_grads, setup_distributed
 
 
 @dataclass
-class OrthrusConfig:
+class DrafterConfig:
     run_dir: str = "runs/drafter_k8"
     model: str = "runs/fused"
     tokenizer: str = "Qwen/Qwen3.5-9B"
@@ -39,14 +39,14 @@ class OrthrusConfig:
     grad_checkpoint: bool = True
 
 
-def train_orthrus(a: OrthrusConfig) -> None:
+def train_drafter(a: DrafterConfig) -> None:
     rank, world, _ = setup_distributed()
     torch.manual_seed(a.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     device = torch.device("cuda", torch.cuda.current_device())
     encoder = Encoder(a.tokenizer)
     base = Qwen3_5ForCausalLM.from_pretrained(a.model, device=device)
-    view = OrthrusView(base, block=a.block).to(device)
+    view = DrafterView(base, block=a.block).to(device)
     view.grad_checkpoint = a.grad_checkpoint
     if a.init:
         view.load_state_dict({k: v.to(device) for k, v in load_file(a.init).items()}, strict=False)

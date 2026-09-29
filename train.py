@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 from dataclasses import fields
 
-from drafter.train import OrthrusConfig, train_orthrus
+from drafter.train import DrafterConfig, train_drafter
 from trainer import Config, run
 
-STAGES = {"sft": Config, "cispo": Config, "drafter": OrthrusConfig}
+STAGES = {"sft": Config, "cispo": Config, "drafter": DrafterConfig}
 
 
 def add_fields(ap: argparse.ArgumentParser, cls) -> None:
@@ -30,7 +30,7 @@ def main() -> None:
     args = vars(ap.parse_args())
     stage = args.pop("stage")
     if stage == "drafter":
-        train_orthrus(OrthrusConfig(**args))
+        train_drafter(DrafterConfig(**args))
     else:
         run(Config(stage=stage, **args))
 

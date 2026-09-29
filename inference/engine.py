@@ -11,7 +11,7 @@ from inference.fp8 import quantize, warm
 from inference.types import Options, Result
 from model.config import LINEAR
 from model.model import apply_rotary, gated_delta_rule_chunk
-from drafter.view import OrthrusView
+from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
@@ -35,7 +35,7 @@ class Engine:
                  window_step: int = 512, sync_every: int = 4, device: str = "cuda"):
         self.device = dev = torch.device(device)
         base, head, encoder = load_export(model, device=device)
-        view = OrthrusView(base, block=block).to(dev)
+        view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
         missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
         if loaded.unexpected_keys or missing:

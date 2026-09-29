@@ -21,7 +21,7 @@ class _CachedCast(torch.autograd.Function):
         return grad.to(torch.float32), None
 
 
-class OrthrusView(nn.Module):
+class DrafterView(nn.Module):
     def __init__(self, base: Qwen3_5ForCausalLM, block: int = 8):
         super().__init__()
         self.base = base

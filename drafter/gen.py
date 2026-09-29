@@ -14,7 +14,7 @@ from model import Qwen3_5ForCausalLM
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sample on-policy thinking chains from a frozen checkpoint for Orthrus distillation.")
+    ap = argparse.ArgumentParser(description="Sample on-policy thinking chains from a frozen checkpoint for drafter distillation.")
     ap.add_argument("--model", default="runs/fused")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
     ap.add_argument("--data-dir", default="data")
