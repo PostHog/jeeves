@@ -29,7 +29,7 @@ This results in better performance on out of domain tasks, and outperforms Jev i
 
 ## Results
 
-Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise. The best result in each row is in bold and underlined.
+Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes.
 
 | bench                                                        | Kev-9B                  | Jev                     | Jeeves                  |
 | ------------------------------------------------------------ | ----------------------- | ----------------------- | ----------------------- |
@@ -50,11 +50,11 @@ Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are 
 | JevBench hard (111 public items)                             | 0.451\*                 | 0.730                   | <ins><b>0.865</b></ins> |
 | JevBench ECE (public items)                                  |                         | 0.049                   | <ins><b>0.037</b></ins> |
 
-\* No Kev-9B JevBench result is published; these are Kev-8B (Qwen3).
+\* No Kev-9B JevBench result is published. These are Kev-8B (Qwen3).
 
 All JevBench numbers are on the public easy, standard and hard tiers (231 items). The sealed judge tier is not included, and the Jev and Kev numbers are restricted to the same public items.
 
-Without thinking the same checkpoint scores 0.804 on our test split (2,962 items), against 0.840 with it. With the fitted temperature (T = 1.859) the no-think path has a top-label ECE of 0.021 and 1.3% confident errors, against Kev-9B's 0.042 and 4.0% and Jev's 0.049 and 3.7%.
+Without thinking the same checkpoint scores 0.804 on our test split (2,962 items), against 0.840 with it.
 
 ## Quickstart
 
@@ -123,7 +123,7 @@ Response on one H100 (FP8), with the three questions thinking in parallel:
 
 ### Python
 
-`sdk/` is a drop-in replacement for Jev's Python SDK (`typesafe-sdk`). It re-exports the official classes and errors unchanged, so existing code only changes its import:
+`sdk/` is a drop-in replacement for Jev's Python SDK (`typesafe-sdk`):
 
 ```bash
 pip install ./sdk
@@ -147,7 +147,7 @@ with TypeSafeClient() as client:
     print(result.reasoning["tone"].text)
 ```
 
-The client connects to `http://127.0.0.1:8009` by default (or `JEEVES_BASE_URL`), needs no API key, and waits up to 120 s. The four options below are optional keyword arguments of `system_one`; leave them out and the request is exactly what `typesafe-sdk` sends. The official `typesafe-sdk` client also works against the server with `base_url` set.
+The client connects to `http://127.0.0.1:8009` by default (or `JEEVES_BASE_URL`), needs no API key, and waits up to 120s.
 
 ### Options
 
@@ -199,11 +199,11 @@ The final probabilities are a softmax over the option scores, divided by a tempe
 
 ### Training
 
-1. **SFT** (2 epochs, 596 steps on 8 GPUs). LoRA r=16 on all projections of Qwen3.5-9B plus the pointer head, trained on 19,126 questions from 12 public datasets and synthetic policy data. Half the questions carry a reasoning chain sampled from the base model; the loss is the pointer head's NLL at `<decide>` only.
-2. **CISPO** (a 624-step schedule stopped at step 402). 9,992 RL questions, 8 rollouts each at temperature 1, capped at 2,560 thinking tokens. The reward is the probability of the right answer, discounted by up to 10% for chains longer than a hinge that moves from 2,048 to 1,024 tokens. The policy gradient runs on the chain tokens, alongside pointer-head NLL on the rollouts and on anchor questions from the SFT set. Sampling masks every special token except `</think>`.
+1. **SFT** (2 epochs, 596 steps on 8 GPUs). LoRA r=16 on all projections of Qwen3.5-9B plus the pointer head, trained on 19,126 questions from 12 public datasets and synthetic policy data. Half the questions carry a reasoning chain sampled from the base model.
+2. **CISPO** (a 624-step schedule stopped at step 402). 9,992 RL questions, 8 rollouts each at temperature 1, capped at 2,560 thinking tokens.
 3. **Calibration**. A single temperature fitted on dev, stored with the checkpoint.
 
-Stopping at step 402 keeps the best calibration and JevBench score; past it, the head over-sharpens on the saturated RL pool.
+Stopping at step 402 keeps the best calibration and dev score. Past it, the head over-sharpens on the saturated RL pool.
 
 ### Diffusion drafter
 
@@ -219,10 +219,6 @@ Unlike Orthrus, which supports attention-only models, it supports Qwen3.5's Gate
 | block 4, eight questions batched            | about 960 in total      |
 
 Block 4 is the default because it stays cheap when several questions are batched.
-
-### Inference engine
-
-`inference/` prefills the shared state once for all questions in a request, then decodes every question's chain together with CUDA-graphed speculative cycles. Weights are FP8 (e4m3, per-channel scales) through a Triton kernel; FP8 matches bf16 accuracy (0.825 vs 0.818 on dev) and speed for one or two questions, and is slower than bf16 for four to eight. Pass `--no-fp8` to serve in bf16.
 
 ## Reproduce
 
@@ -268,7 +264,6 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 
 - Knowledge questions trail Jev (MMLU 0.793 vs 0.900, MMLU-Pro 0.739 vs 0.840).
 - Thinking is slow at the tail: 17 s at p90 with full chains. Use `max_think` and `nothink_threshold` when latency matters.
-- About a third of full-length chains hit the 2,560-token cap without closing; the answer is still read out, and accuracy on those items is lower.
 - The Kev and Jev comparisons outside JevBench use different items from the same sources.
 - No language consistency reward was included so thinking chains are not well interpretable.
 
