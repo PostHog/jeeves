@@ -7,12 +7,14 @@ SIMD = 32
 BV = 8
 WIDE_ROW_THREADS = 256
 WIDE_ROW_DIM = 2048
+ATTENTION_SPLITS = 2
 
 SOURCE = f"""
 #include <metal_stdlib>
 using namespace metal;
 
 constant constexpr uint DK = {DK}, DV = {DV}, BV = {BV}, SIMD = {SIMD}, ROWS_PER_LANE = DK / SIMD, WIDE_ROW_THREADS = {WIDE_ROW_THREADS};
+constant constexpr uint ATTENTION_SPLITS = {ATTENTION_SPLITS};
 constant constexpr float Q_SCALE = {DK ** -0.5!r}f;
 """ + r"""
 // Metal's exp is biased low near 0 and the state takes one decay factor per token, so small |g| uses a Taylor series exact in fp32.
@@ -146,6 +148,80 @@ kernel void rotary(device const bfloat* x [[buffer(0)]], device const float* cos
     const float c = float(bfloat(cos_[freq])), s = float(bfloat(sin_[freq]));
     out[idx] = bfloat(float(bfloat(float(x[idx]) * c)) + float(bfloat(partner * s)));
 }
+
+// A few queries attend over a key/value cache laid out (row, position, kv head, D). Each threadgroup handles one (b, head, query):
+// every simdgroup runs an online softmax over its share of the positions, with D split across lanes, and simdgroup 0 merges them.
+template <uint D>
+inline void cached_attention(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
+                             device bfloat* out, uint Q, uint H, uint HKV, uint L, uint row_stride, float scale, uint3 tg, uint sg,
+                             uint lane, threadgroup float* part_max, threadgroup float* part_sum, threadgroup float* part_out) {
+    constexpr uint DPL = D / SIMD;
+    const uint qi = tg.x, h = tg.y, b = tg.z;
+    const uint kv_head = h / (H / HKV), out_base = ((b * Q + qi) * H + h) * D + lane * DPL;
+    float qv[DPL], o[DPL];
+    for (uint i = 0; i < DPL; ++i) {
+        qv[i] = float(q[out_base + i]);
+        o[i] = 0.0f;
+    }
+    device const bfloat* kb = k + b * row_stride + kv_head * D + lane * DPL;
+    device const bfloat* vb = v + b * row_stride + kv_head * D + lane * DPL;
+    device const bool* allowed = mask + (b * Q + qi) * L;
+    const uint share = (L + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS, first = sg * share, last = min(L, first + share);
+    float m = -INFINITY, s = 0.0f;
+    for (uint l = first; l < last; ++l) {
+        if (!allowed[l])
+            continue;
+        float dot = 0.0f;
+        for (uint i = 0; i < DPL; ++i)
+            dot += qv[i] * float(kb[l * HKV * D + i]);
+        const float score = simd_sum(dot) * scale;
+        const float m_new = max(m, score);
+        const float rescale = precise::exp(m - m_new), p = precise::exp(score - m_new);
+        s = s * rescale + p;
+        for (uint i = 0; i < DPL; ++i)
+            o[i] = o[i] * rescale + p * float(vb[l * HKV * D + i]);
+        m = m_new;
+    }
+    if (lane == 0) {
+        part_max[sg] = m;
+        part_sum[sg] = s;
+    }
+    for (uint i = 0; i < DPL; ++i)
+        part_out[sg * D + lane * DPL + i] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0)
+        return;
+    float m_all = -INFINITY;
+    for (uint g = 0; g < ATTENTION_SPLITS; ++g)
+        m_all = max(m_all, part_max[g]);
+    float s_all = 0.0f, o_all[DPL];
+    for (uint i = 0; i < DPL; ++i)
+        o_all[i] = 0.0f;
+    for (uint g = 0; g < ATTENTION_SPLITS; ++g) {
+        if (part_max[g] == -INFINITY)
+            continue;
+        const float w = precise::exp(part_max[g] - m_all);
+        s_all += part_sum[g] * w;
+        for (uint i = 0; i < DPL; ++i)
+            o_all[i] += part_out[g * D + lane * DPL + i] * w;
+    }
+    for (uint i = 0; i < DPL; ++i)
+        out[out_base + i] = bfloat(o_all[i] / s_all);
+}
+
+#define CACHED_ATTENTION_KERNEL(D) \
+kernel void cached_attention_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], \
+                                 device const bfloat* v [[buffer(2)]], device const bool* mask [[buffer(3)]], device bfloat* out [[buffer(4)]], \
+                                 constant long& Q [[buffer(5)]], constant long& H [[buffer(6)]], constant long& HKV [[buffer(7)]], \
+                                 constant long& L [[buffer(8)]], constant long& row_stride [[buffer(9)]], constant float& scale [[buffer(10)]], \
+                                 uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                                 uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float part_max[ATTENTION_SPLITS], part_sum[ATTENTION_SPLITS], part_out[ATTENTION_SPLITS * D]; \
+    cached_attention<D>(q, k, v, mask, out, uint(Q), uint(H), uint(HKV), uint(L), uint(row_stride), scale, tg, sg, lane, \
+                        part_max, part_sum, part_out); \
+}
+CACHED_ATTENTION_KERNEL(128)
+CACHED_ATTENTION_KERNEL(256)
 """
 
 _library = None
@@ -221,4 +297,21 @@ def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
     out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
     if x.numel():
         library().rotary(x.contiguous(), cos, sin, out, H, D, half, threads=(D, B * T * H, 1), group_size=(min(D, 256), 1, 1))
+    return out
+
+
+def cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, length: int, mask: torch.Tensor, scale: float) -> torch.Tensor:
+    B, Q, H, D = q.shape
+    rows, slots, HKV = k_cache.shape[:3]
+    _require("q", q, torch.bfloat16, (B, Q, H, D))
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if cache.dtype != torch.bfloat16 or not cache.is_contiguous() or tuple(cache.shape) != (rows, slots, HKV, D) or rows < B or slots < length:
+            raise ValueError(f"{name}: expected contiguous bfloat16 (>={B}, >={length}, {HKV}, {D}), got {cache.dtype} {tuple(cache.shape)}")
+    _require("mask", mask, torch.bool, (B, Q, length))
+    if D not in (128, 256) or H % HKV:
+        raise ValueError(f"unsupported head layout: {H} query heads, {HKV} key/value heads, head dim {D}")
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    kernel = library().cached_attention_128 if D == 128 else library().cached_attention_256
+    kernel(q.contiguous(), k_cache, v_cache, mask.contiguous(), out, Q, H, HKV, length, k_cache.stride(0), scale,
+           threads=(SIMD * ATTENTION_SPLITS * Q, H, B), group_size=(SIMD * ATTENTION_SPLITS, 1, 1))
     return out

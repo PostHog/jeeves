@@ -133,6 +133,16 @@ class Engine:
         else:
             state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
 
+    def cache_attention(self, q, k_cache, v_cache, length: int, mask, scale: float, gqa: bool) -> torch.Tensor:
+        B = q.shape[0]
+        # The Metal kernel beats MPS SDPA for one row; with more rows each query's cache reads stop fitting in cache and MPS is as fast.
+        if self.metal and B == 1:
+            return metal.cached_attention(q, k_cache, v_cache, length, mask[:, 0], scale)
+        keys, vals = k_cache[:B, :length], v_cache[:B, :length]
+        with sdpa_kernel(EFFICIENT):
+            return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
+                                                  enable_gqa=gqa).transpose(1, 2)
+
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
         if not self.metal:
             return self.base.lm_head(h)
@@ -240,10 +250,7 @@ class Engine:
                 vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
-                keys, vals = self.dk[i][:B, :Lw + M], self.dv[i][:B, :Lw + M]
-                with sdpa_kernel(EFFICIENT):
-                    o_m = F.scaled_dot_product_attention(qm.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2),
-                                                         attn_mask=mask[:, :, K:], scale=Dv ** -0.5).transpose(1, 2)
+                o_m = self.cache_attention(qm, self.dk[i], self.dv[i], Lw + M, mask[:, :, K:], Dv ** -0.5, gqa=False)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
                 o = lin.norm(o.reshape(-1, Dv), z.reshape(-1, Dv)).view(B, K + M, lin.value_dim)
@@ -262,10 +269,7 @@ class Engine:
                 self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
                 self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
-                keys, vals = self.k[i][:B, :Lw + M], self.v[i][:B, :Lw + M]
-                with sdpa_kernel(EFFICIENT):
-                    o = F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask,
-                                                       scale=att.scaling, enable_gqa=True).transpose(1, 2)
+                o = self.cache_attention(q, self.k[i], self.v[i], Lw + M, mask, att.scaling, gqa=True)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))

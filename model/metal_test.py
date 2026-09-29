@@ -115,8 +115,27 @@ def norms_and_rotary() -> list[str]:
     return failures
 
 
+def attention() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(3)
+    for H, HKV, D, Q, L in ((32, 32, 128, 12, 524), (16, 4, 256, 16, 524), (32, 32, 128, 12, 2572)):
+        k_cache, v_cache = (torch.randn(2, L + 40, HKV, D, generator=gen).to(torch.bfloat16).to(MPS) for _ in range(2))
+        q = torch.randn(1, Q, H, D, generator=gen).to(torch.bfloat16).to(MPS)
+        mask = (torch.rand(1, Q, L, generator=gen) < 0.9).to(MPS)
+        mask[..., 0] = True
+        sdpa = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k_cache[:1, :L].transpose(1, 2), v_cache[:1, :L].transpose(1, 2), attn_mask=mask[:, None], scale=D ** -0.5,
+            enable_gqa=True).transpose(1, 2)
+        out = metal.cached_attention(q, k_cache, v_cache, L, mask, D ** -0.5)
+        equal = (out == sdpa).float().mean().item()
+        print(f"cached_attention H={H} HKV={HKV} D={D} L={L}: bitwise equal to SDPA {equal:.5f}")
+        if equal < 0.999 or ((out.float() - sdpa.float()).abs() > sdpa.float().abs() * 2 ** -7 + 1e-3).any():
+            failures.append(f"cached_attention D={D} L={L} differs from SDPA by more than one bf16 rounding")
+    return failures
+
+
 def main() -> None:
-    failures = exactness() + norms_and_rotary()
+    failures = exactness() + norms_and_rotary() + attention()
     for B, T in ((1, 4), (3, 160), (1, 2048)):
         failures += accuracy(B, T)
     print("\n".join(failures) if failures else "all checks passed")
