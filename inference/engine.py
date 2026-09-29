@@ -7,7 +7,7 @@ from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from export import load_export
-from inference.fp8 import quantize
+from inference.fp8 import quantize, warm
 from inference.types import Options, Result
 from model.config import LINEAR
 from model.model import apply_rotary, gated_delta_rule_chunk
@@ -44,6 +44,7 @@ class Engine:
         self.dtype = base.lm_head.weight.dtype
         if fp8:
             quantize(view)
+            warm(view)
         else:
             for proj in view.projections():
                 proj.to(self.dtype)

@@ -2,11 +2,10 @@
 
 A reasoning Jev-style classifier with a diffusion drafter, trained with SFT and CISPO.
 
-![Jeeves](/assets/smug.png)
+<img src="assets/smug.png" alt="Jeeves" width="220">
 
 <p>
   <a href="https://huggingface.co/collections/"><img alt="Weights: 9B" src="https://img.shields.io/badge/WEIGHTS-9B-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
-  <a href="https://huggingface.co/spaces/"><img alt="Demo on Hugging Face Spaces" src="https://img.shields.io/badge/DEMO-HF%20Spaces-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
   <a href="https://huggingface.co/datasets/"><img alt="Frozen eval suites" src="https://img.shields.io/badge/EVAL%20SUITES-frozen-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0a0a0a.svg?style=for-the-badge&labelColor=000000" height="28"></a>
 </p>

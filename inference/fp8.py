@@ -15,7 +15,7 @@ LARGE_M = 256
 TARGET_BLOCKS = 264
 
 
-@triton.autotune(configs=CONFIGS, key=["MB", "N", "K", "SPLIT"])
+@triton.autotune(configs=CONFIGS, key=["MB", "N", "K", "SPLIT"], cache_results=True)
 @triton.jit
 def w8a16_kernel(x_ptr, w_ptr, s_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym, MB,
                  SPLIT: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
@@ -94,3 +94,16 @@ def quantize(module: nn.Module) -> int:
         else:
             n += quantize(child)
     return n
+
+
+@torch.no_grad()
+def warm(module: nn.Module) -> int:
+    seen = set()
+    for m in module.modules():
+        if isinstance(m, FP8Linear) and (m.out_features, m.in_features) not in seen:
+            seen.add((m.out_features, m.in_features))
+            w = m.weight
+            for rows in (16, 32, 64, 128, 256):
+                m(torch.zeros(rows, m.in_features, device=w.device, dtype=torch.bfloat16))
+    return len(seen)
+
