@@ -12,7 +12,7 @@ from export import load_export
 from inference.types import Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step
+from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -40,7 +40,7 @@ class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
                  window_step: int = 512, sync_every: int | None = None, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
-        self.metal = dev.type == "mps"
+        self.mps = dev.type == "mps"
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
@@ -57,8 +57,8 @@ class Engine:
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
-        if self.metal:
-            # MPS multiplies 12 or more input rows faster, with bitwise-equal results, by transposed weight storage; the 4-row candidate projections get slower, so they keep theirs.
+        if self.mps and torch.backends.mps.is_macos_or_newer(15, 0):
+            # On torch 2.14, MPS computes x @ W.T faster, and bitwise equal, with W.T contiguous once x has 10 or more rows, but slower with fewer; so only projections fed the K + M cycle rows switch, except attn_k/attn_v, which are slower even at M rows.
             for layer in base.model.layers:
                 mixer = (layer.linear_attn.in_proj_z, layer.linear_attn.out_proj) if layer.layer_type == LINEAR else (layer.self_attn.o_proj,)
                 for proj in (*mixer, layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
@@ -114,6 +114,10 @@ class Engine:
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
 
+    @property
+    def metal(self) -> bool:
+        return self.mps and metal_enabled()
+
     def delta_extend(self, q, k, v, g, beta, state, commit: bool) -> torch.Tensor:
         if self.metal:
             return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, advance_state=commit)
@@ -133,23 +137,33 @@ class Engine:
         else:
             state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
 
-    def cache_attention(self, q, k_cache, v_cache, length: int, mask, scale: float, gqa: bool) -> torch.Tensor:
-        B = q.shape[0]
-        # The Metal kernel beats MPS SDPA for one row; with more rows each query's cache reads stop fitting in cache and MPS is as fast.
-        if self.metal and B == 1:
-            return metal.cached_attention(q, k_cache, v_cache, length, mask[:, 0], scale)
+    def cached_attention(self, q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
+        B, length = q.shape[0], mask.shape[-1]
+        gqa = q.shape[2] != k_cache.shape[2]
+        # On torch 2.14 the Metal kernel beats MPS SDPA for the attention layers at any row count, but for the delta layers' mask queries only up
+        # to 2 rows, because each of their 12 queries per head re-reads the head's whole cache.
+        if self.metal and (gqa or B <= 2):
+            return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale)
         keys, vals = k_cache[:B, :length], v_cache[:B, :length]
         with sdpa_kernel(EFFICIENT):
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
                                                   enable_gqa=gqa).transpose(1, 2)
 
+    def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hc, hm = h[:, :self.K], h[:, self.K:]
+        # With more than one row hc is strided, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
+        return (hc.contiguous() if self.mps else hc), hm
+
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
-        if not self.metal:
+        if not self.mps:
             return self.base.lm_head(h)
         # MPS in torch 2.14 picks a slow kernel for the 248k-row matmul; row chunks of the weight give bitwise-equal logits much faster.
         return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
 
-    def bucket(self, n: int) -> int:
+    def decode_rows(self, n: int) -> int:
+        if self.device.type != "cuda":
+            return n
+        # CUDA captures a graph per row count, so rounding up to a power of two keeps the number of graphs small.
         b = 1
         while b < n:
             b *= 2
@@ -219,6 +233,7 @@ class Engine:
         pos_c = n[:, None] + self.ar_k[None]
         pos = torch.cat((pos_c, n[:, None] + self.mask_offset[None]), dim=1)
         cos, sin = base.model.rotary_emb(pos)
+        cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:]))
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
@@ -231,7 +246,7 @@ class Engine:
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
-                hc, hm = h[:, :K], h[:, K:]
+                hc, hm = self.split_candidate_rows(h)
                 ext = torch.cat((self.conv[i][:B], lin.in_proj_qkv(hc).transpose(1, 2)), dim=-1)
                 conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -K:]).transpose(1, 2)
                 q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
@@ -243,14 +258,14 @@ class Engine:
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(hc).float() + lin.dt_bias)
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
-                self.dk[i][rows, pos_c] = apply_rotary(k, cos[:, :K], sin[:, :K])
+                self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
                 self.dv[i][rows, pos_c] = v
-                qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos[:, K:], sin[:, K:])
-                km = apply_rotary(view.delta_k[key](hm).view(B, M, Hv, Dv), cos[:, K:], sin[:, K:])
+                qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
+                km = apply_rotary(view.delta_k[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
                 vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
-                o_m = self.cache_attention(qm, self.dk[i], self.dv[i], Lw + M, mask[:, :, K:], Dv ** -0.5, gqa=False)
+                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
                 o = lin.norm(o.reshape(-1, Dv), z.reshape(-1, Dv)).view(B, K + M, lin.value_dim)
@@ -258,7 +273,7 @@ class Engine:
             else:
                 att = layer.self_attn
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
-                hc, hm = h[:, :K], h[:, K:]
+                hc, hm = self.split_candidate_rows(h)
                 qc, gc = att.q_proj(hc).view(B, K, H, 2 * D).chunk(2, dim=-1)
                 qm, gm = view.attn_q[key](hm).view(B, M, H, 2 * D).chunk(2, dim=-1)
                 q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
@@ -269,7 +284,7 @@ class Engine:
                 self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
                 self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
-                o = self.cache_attention(q, self.k[i], self.v[i], Lw + M, mask, att.scaling, gqa=True)
+                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
@@ -320,8 +335,7 @@ class Engine:
 
     @torch.no_grad()
     def decode(self, B: int, prompts: list[list[int]], first: torch.Tensor, caps: list[int]) -> tuple[list[list[int]], list[bool]]:
-        # Rounding the rows up to a power of two keeps CUDA to a few graph shapes. Without graphs the padding rows are wasted compute.
-        Bp = self.bucket(B) if self.device.type == "cuda" else B
+        Bp = self.decode_rows(B)
         dev = self.device
         self.n[:Bp].zero_()
         self.n[:B].copy_(torch.tensor([len(p) for p in prompts], device=dev))
@@ -384,26 +398,25 @@ class Engine:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
         budget = opts.max_think if opts.think else 0
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
-        P = common_prefix(prompts) if B > 1 else 0
-        self.reset(self.bucket(B))
+        P = common_prefix(prompts) if B > 1 or not self.mps else 0
+        self.reset(self.decode_rows(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
-        nothink = None
-        if any(caps) or opts.nothink_threshold is not None:
+        tails = [self.empty_think + r for r in rems]
+        first = nothink = None
+        if self.mps and not any(caps):
+            hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
+            nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
+        else:
             h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
             last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
             first = (self.vocab_logits(last) + self.bias).argmax(-1)
             if opts.nothink_threshold is not None or not all(caps):
-                seqs = [self.empty_think + r for r in rems]
-                hn = self.extend(seqs, [len(p) for p in prompts], commit=False)
-                nothink = [self.readout(hn[b], seqs[b]) for b in range(B)]
+                hn = self.extend(tails, [len(p) for p in prompts], commit=False)
+                nothink = [self.readout(hn[b], tails[b]) for b in range(B)]
                 if opts.nothink_threshold is not None:
                     caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
-        else:
-            tails = [self.empty_think + r for r in rems]
-            hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
-            nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
         chains, closed = [[] for _ in range(B)], [False] * B
         probs = list(nothink) if nothink is not None else [[] for _ in range(B)]
         if any(caps):

@@ -66,6 +66,7 @@ _AVAILABLE = {
     "fused_lce": _FlaFusedLCE is not None,
     "causal_conv1d": _fla_causal_conv1d is not None and _fla_causal_conv1d_update is not None,
     "flash_attn": _flash_attn_func is not None,
+    "metal": torch.backends.mps.is_available(),
 }
 _ENABLED_BY_ENV = os.environ.get("QWEN35_KERNELS", "1") not in ("0", "false", "False")
 KERNELS = {k: v and _ENABLED_BY_ENV for k, v in _AVAILABLE.items()}
@@ -91,8 +92,12 @@ def _needs_grad(*xs: torch.Tensor) -> bool:
     return torch.is_grad_enabled() and any(x.requires_grad for x in xs)
 
 
+def metal_enabled() -> bool:
+    return KERNELS["metal"] and not torch.compiler.is_compiling()
+
+
 def _on_metal(*xs: torch.Tensor) -> bool:
-    return _ENABLED_BY_ENV and all(x.is_mps and x.dtype == torch.bfloat16 for x in xs) and not _needs_grad(*xs)
+    return metal_enabled() and all(x.is_mps and x.dtype == torch.bfloat16 for x in xs) and not _needs_grad(*xs)
 
 
 class RMSNorm(nn.Module):
