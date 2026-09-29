@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import queue
 import random
 import threading
