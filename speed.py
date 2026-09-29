@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import statistics
 import time
 from pathlib import Path
 
 import torch
+from huggingface_hub import try_to_load_from_cache
 
 from inference.engine import Engine
 from inference.types import Options
@@ -20,7 +22,18 @@ EVAL_MAX_THINK = 256
 
 
 def default_snapshot() -> str:
-    return str(next(Path.home().glob(".cache/huggingface/hub/models--PostHog--jeeves/snapshots/*")))
+    config = try_to_load_from_cache("PostHog/jeeves", "config.json")
+    if not isinstance(config, str):
+        raise FileNotFoundError("PostHog/jeeves is not in the Hugging Face cache: run `hf download PostHog/jeeves`")
+    return os.path.dirname(config)
+
+
+def argmax(p: list[float]) -> int:
+    return max(range(len(p)), key=p.__getitem__)
+
+
+def as_record(r, thought: bool | None = None) -> dict:
+    return {"chain": r.chain, "probs": r.probs, "closed": r.closed, "thought": r.thought if thought is None else thought}
 
 
 def workload(records: list[DataFormat]) -> list[tuple[DataFormat, Options]]:
@@ -30,8 +43,7 @@ def workload(records: list[DataFormat]) -> list[tuple[DataFormat, Options]]:
 
 
 def run(engine: Engine, jobs: list[tuple[DataFormat, Options]]) -> list[list[dict]]:
-    return [[{"chain": r.chain, "probs": r.probs, "closed": r.closed, "thought": r.thought} for r in engine.answer(rec, opts)]
-            for rec, opts in jobs]
+    return [[as_record(r) for r in engine.answer(rec, opts)] for rec, opts in jobs]
 
 
 def compare(outputs: list[list[dict]], reference: list[list[dict]]) -> dict:
@@ -41,7 +53,6 @@ def compare(outputs: list[list[dict]], reference: list[list[dict]]) -> dict:
     for a, b in thought:
         if a["chain"] != b["chain"]:
             divergence.append(next((i for i, (x, y) in enumerate(zip(a["chain"], b["chain"])) if x != y), min(len(a["chain"]), len(b["chain"]))))
-    argmax = lambda p: max(range(len(p)), key=p.__getitem__)
     return {"chains_identical": f"{len(thought) - len(divergence)}/{len(thought)}", "first_divergence": divergence,
             "max_prob_diff": max(abs(x - y) for a, b in pairs for x, y in zip(a["probs"], b["probs"], strict=True)),
             "argmax_agree": f"{sum(argmax(a['probs']) == argmax(b['probs']) for a, b in pairs)}/{len(pairs)}"}
@@ -71,12 +82,10 @@ def evaluate(engine: Engine, records: list[DataFormat], n: int) -> tuple[dict, l
     for rec in chosen:
         nothink = engine.answer(rec, Options(think=False))
         think = engine.answer(rec, Options(max_think=EVAL_MAX_THINK))
-        outputs.append([{"chain": r.chain, "probs": r.probs, "closed": r.closed, "thought": r.thought} for r in think]
-                       + [{"chain": [], "probs": r.probs, "closed": False, "thought": False} for r in nothink])
+        outputs.append([as_record(r) for r in think] + [as_record(r, thought=False) for r in nothink])
         for q, t, nt in zip(rec.questions, think, nothink):
             label = q.label_index()
             rows.append((t.probs, nt.probs, label))
-    argmax = lambda p: max(range(len(p)), key=p.__getitem__)
     summary = {"eval_questions": len(rows), "eval_seconds": round(time.perf_counter() - t0, 1),
                "think_acc": round(sum(argmax(t) == y for t, _, y in rows) / len(rows), 4),
                "nothink_acc": round(sum(argmax(nt) == y for _, nt, y in rows) / len(rows), 4),

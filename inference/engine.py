@@ -35,6 +35,7 @@ class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
                  window_step: int = 512, sync_every: int | None = None, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
+        self.metal = dev.type == "mps"
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
@@ -92,7 +93,6 @@ class Engine:
         self.ar_k = torch.arange(K, device=dev)
         self.ar_j = torch.arange(J, device=dev)
         self.ar_l = torch.arange(max_len + 1, device=dev)
-        self.all_steps = torch.full((max_rows,), K, dtype=torch.long, device=dev)
         block_of_mask = torch.arange(K, device=dev).repeat_interleave(J)
         self.mask_offset = block_of_mask + (self.ar_j + 1).repeat(K)
         self.limit_offset = torch.cat((self.ar_k, block_of_mask))
@@ -100,33 +100,31 @@ class Engine:
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
-        # MPS runs the full-vocabulary matmul about 3x slower than the same matmul in 8 row chunks, which give bitwise-equal logits.
-        self.lm_head_chunks = base.lm_head.weight.chunk(8) if dev.type == "mps" else None
 
-    def delta_prefill(self, q, k, v, g, beta, state, commit: bool) -> torch.Tensor:
-        if self.device.type == "cuda":
-            o, final = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=state, output_final_state=True)
-            if commit:
-                state.copy_(final)
-            return o
-        steps = torch.full((q.shape[0],), q.shape[1], dtype=torch.long, device=q.device)
-        return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, steps, advance_state=commit)
+    def delta_extend(self, q, k, v, g, beta, state, commit: bool) -> torch.Tensor:
+        if self.metal:
+            return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, advance_state=commit)
+        o, final = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=state, output_final_state=True)
+        if commit:
+            state.copy_(final)
+        return o
 
-    def delta_forward(self, q, k, v, g, beta, state) -> torch.Tensor:
-        if self.device.type == "cuda":
-            return delta_step(q, k, v, g, beta, state, False)[0]
-        return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, self.all_steps)
+    def delta_outputs(self, q, k, v, g, beta, state) -> torch.Tensor:
+        if self.metal:
+            return metal.gated_delta_rule_outputs(q, k, v, g, beta, state)
+        return delta_step(q, k, v, g, beta, state, False)[0]
 
-    def delta_commit(self, k, v, g, beta, state, keep, accepted) -> None:
-        if self.device.type == "cuda":
-            state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
+    def delta_commit(self, k, v, g, beta, state, accepted, keep) -> None:
+        if self.metal:
+            metal.gated_delta_rule_advance_inplace(k, v, g, beta, state, accepted)
         else:
-            metal.gated_delta_rule_advance_(k, v, g, beta, state, accepted)
+            state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
 
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
-        if self.lm_head_chunks is None:
+        if not self.metal:
             return self.base.lm_head(h)
-        return torch.cat([F.linear(h, w) for w in self.lm_head_chunks], dim=-1)
+        # MPS in torch 2.14 picks a slow kernel for the 248k-row matmul; row chunks of the weight give bitwise-equal logits much faster.
+        return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
 
     def bucket(self, n: int) -> int:
         b = 1
@@ -166,7 +164,7 @@ class Engine:
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
                 beta = lin.in_proj_b(h).sigmoid() * keep.to(h.dtype)
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(h).float() + lin.dt_bias) * keep
-                o = self.delta_prefill(q, k, v, g, beta, self.rec[i][:B], commit)
+                o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
                     self.conv[i][:B].copy_(ext.gather(2, idx))
@@ -217,10 +215,10 @@ class Engine:
                 rep = lin.num_v_heads // lin.num_k_heads
                 q = q.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                v = v.reshape(B, K, Hv, Dv)
+                v = v.reshape(B, K, Hv, Dv).contiguous()
                 beta = lin.in_proj_b(hc).sigmoid()
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(hc).float() + lin.dt_bias)
-                o_c = self.delta_forward(q, k, v, g, beta, self.rec[i][:B])
+                o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos[:, :K], sin[:, :K])
                 self.dv[i][rows, pos_c] = v
@@ -269,9 +267,9 @@ class Engine:
         jm1 = (j - 1).clamp(min=0)
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
-        keep = (self.ar_k[None] < j[:, None]).float()[..., None]
+        keep = None if self.metal else (self.ar_k[None] < j[:, None]).float()[..., None]
         for i, (k, v, g, beta, ext) in pending.items():
-            self.delta_commit(k, v, g, beta, self.rec[i][:B], keep, j)
+            self.delta_commit(k, v, g, beta, self.rec[i][:B], j, keep)
             idx = (j[:, None] + torch.arange(ext.shape[-1] - K, device=self.device)[None])[:, None, :].expand(B, ext.shape[1], -1)
             self.conv[i][:B].copy_(ext.gather(2, idx))
         cand.copy_(torch.where(done[:, None], cand, nxt))
