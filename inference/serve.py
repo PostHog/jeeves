@@ -25,10 +25,10 @@ class Server:
     def systemone(self, body) -> dict:
         record, model, opts = parse_request(body, self.defaults)
         with self.lock:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             t0 = time.time()
             results = self.engine.answer(record, opts)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             ms = (time.time() - t0) * 1000
         return response(record, model, opts, results, self.engine.encoder.tok, ms)
 

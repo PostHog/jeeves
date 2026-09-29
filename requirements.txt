@@ -1,6 +1,6 @@
 torch==2.14.0
-triton==3.8.0
-flash-linear-attention==0.5.2
+triton==3.8.0; sys_platform == "linux"
+flash-linear-attention==0.5.2; sys_platform == "linux"
 transformers==5.17.0
 tokenizers==0.23.2
 safetensors==0.8.0

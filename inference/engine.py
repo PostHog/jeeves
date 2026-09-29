@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from export import load_export
-from inference.fp8 import quantize, warm
 from inference.types import Options, Result
 from model.config import LINEAR
-from model.model import apply_rotary, gated_delta_rule_chunk
+from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -18,7 +18,7 @@ EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
-    return fused_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=state, output_final_state=final, use_qk_l2norm_in_kernel=True)
+    return gated_delta_rule_step(q, k, v, g, beta, initial_state=state, output_final_state=final)
 
 
 def common_prefix(seqs: list[list[int]]) -> int:
@@ -32,9 +32,9 @@ def common_prefix(seqs: list[list[int]]) -> int:
 
 class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
-                 window_step: int = 512, sync_every: int = 4, device: str = "cuda"):
-        self.device = dev = torch.device(device)
-        base, head, encoder = load_export(model, device=device)
+                 window_step: int = 512, sync_every: int = 4, device: str | None = None):
+        self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
+        base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
         missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
@@ -42,14 +42,15 @@ class Engine:
             raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
         view.requires_grad_(False)
         self.dtype = base.lm_head.weight.dtype
-        fp8 = fp8 and torch.cuda.get_device_capability(dev) >= (8, 9)
+        fp8 = fp8 and dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)
         if fp8:
+            from inference.fp8 import quantize, warm
             quantize(view)
             warm(view)
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.fp8 = fp8
         self.cfg = cfg = base.cfg
@@ -95,7 +96,7 @@ class Engine:
         row_block = torch.cat((torch.full((K,), -1, device=dev), block_of_mask))
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
 
     def bucket(self, n: int) -> int:
         b = 1
@@ -269,6 +270,11 @@ class Engine:
         self.graphs[(B, Lw)] = g
         return g
 
+    def cycle_runner(self, B: int, Lw: int) -> Callable[[], None]:
+        if self.device.type == "cuda":
+            return self.graph(B, Lw).replay
+        return lambda: self.cycle(B, Lw)
+
     @torch.no_grad()
     def decode(self, B: int, prompts: list[list[int]], first: torch.Tensor, caps: list[int]) -> tuple[list[list[int]], list[bool]]:
         Bp = self.bucket(B)
@@ -285,9 +291,9 @@ class Engine:
         top = max(len(p) for p in prompts)
         while True:
             need = top + (self.sync_every + 1) * self.K + 1
-            g = self.graph(Bp, min(self.L, -(-need // self.window_step) * self.window_step))
+            run_cycle = self.cycle_runner(Bp, min(self.L, -(-need // self.window_step) * self.window_step))
             for _ in range(self.sync_every):
-                g.replay()
+                run_cycle()
             finished, top = torch.stack((self.done[:Bp].all().long(), self.n[:B].max())).tolist()
             if finished:
                 break

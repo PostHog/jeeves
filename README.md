@@ -19,7 +19,7 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 - Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev).
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
 - About 0.3 s per request without thinking and a 3.3 s median with it on one H100. Can be sped up by truncating chain length.
-- Runs on CUDA (Hopper for the FP8 kernel).
+- Runs on CUDA (Hopper for the FP8 kernel). Inference also runs on Apple Silicon (MPS, bf16).
 
 ## Problem
 
@@ -58,7 +58,7 @@ Without thinking the same checkpoint scores 0.804 on our test split (2,962 items
 
 ## Quickstart
 
-Requirements: Python 3.12 and a CUDA GPU.
+Requirements: Python 3.12 and a CUDA GPU. Inference also runs on an Apple Silicon Mac with 48 GB or more.
 
 ```bash
 pip install -r requirements.txt
@@ -69,6 +69,12 @@ Download the released weights and serve them:
 ```bash
 hf download PostHog/jeeves --local-dir jeeves-weights
 python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafter_k4.safetensors --port 8009
+```
+
+On a Mac, the engine runs in bf16 on MPS. The weights use 21 GB. The default caches (`--max-rows 8 --max-len 8192`) use another 28 GB, so a 48 GB Mac starts to swap. Use smaller caches:
+
+```bash
+python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafter_k4.safetensors --max-rows 4 --max-len 4096 --port 8009
 ```
 
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:

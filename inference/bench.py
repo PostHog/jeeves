@@ -44,10 +44,10 @@ def main(argv: list[str] | None = None) -> None:
     engine.answer(records[0], Options(max_think=16))
     rows, lat = [], []
     for rec in records:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t0 = time.time()
         results = engine.answer(rec, opts)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         lat.append(time.time() - t0)
         for q, r in zip(rec.questions, results):
             p = r.probs
