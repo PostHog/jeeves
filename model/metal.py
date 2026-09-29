@@ -341,7 +341,187 @@ def cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tens
     return out
 
 
-SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _ROTARY + _CACHED_ATTENTION
+
+# Multi-query attention for several rows: each threadgroup takes one (row, kv head, chunk of positions) and the query rows that share that
+# kv head, so a chunk of the cache is read once for all of them. merge_attention_chunks then combines the chunks' partial softmaxes.
+
+CHUNK_POSITIONS = 256
+MULTI_QUERY_CONFIGS = {128: (2, 6, True), 256: (4, 7, False)}
+
+_MULTI_QUERY_ATTENTION = f"""
+constant constexpr uint CHUNK_POSITIONS = {CHUNK_POSITIONS};
+""" + r"""
+inline float4 bf16x4(uint2 w) {
+    return float4(as_type<float>(w.x << 16), as_type<float>(w.x & 0xffff0000u), as_type<float>(w.y << 16), as_type<float>(w.y & 0xffff0000u));
+}
+
+// Scores: lane i owns position l0 + i of each 32-position block (K rows come from threadgroup memory when STAGE_K, padded against bank
+// conflicts, or straight from device memory). Values: lanes split D, so value rows are read coalesced. Simdgroup s owns QPS query rows.
+template <uint D, uint QPS, uint NSG, bool STAGE_K>
+inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
+                              device float* part_max, device float* part_sum, device float* part_out, uint Q, uint H, uint HKV, uint L,
+                              uint row_stride, float scale, uint n_chunks, uint n_row_groups, uint3 tg, uint sg, uint lane, uint tid,
+                              threadgroup float* qs, threadgroup bfloat* ks) {
+    constexpr uint DIMS_PER_LANE = D / SIMD, K_PITCH = D + 8, ROWS_PER_GROUP = NSG * QPS;
+    const uint chunk = tg.x / n_row_groups, row_group = tg.x % n_row_groups, kv_head = tg.y, b = tg.z;
+    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, r0 = row_group * ROWS_PER_GROUP + sg * QPS;
+    threadgroup float* my_q = qs + sg * QPS * D;
+    for (uint j = 0; j < QPS; ++j) {
+        const uint r = r0 + j, qi = r / heads_per_kv, h = kv_head * heads_per_kv + r % heads_per_kv;
+        for (uint d = lane; d < D; d += SIMD)
+            my_q[j * D + d] = r < G ? float(q[((b * Q + qi) * H + h) * D + d]) : 0.0f;
+    }
+    device const bfloat* kb = k + b * row_stride + kv_head * D;
+    device const bfloat* vb = v + b * row_stride + kv_head * D + lane * DIMS_PER_LANE;
+    const uint position_stride = HKV * D, c0 = chunk * CHUNK_POSITIONS, c1 = min(L, c0 + CHUNK_POSITIONS);
+    float m[QPS], s[QPS], o[QPS][DIMS_PER_LANE];
+    for (uint j = 0; j < QPS; ++j) {
+        m[j] = -INFINITY;
+        s[j] = 0.0f;
+        for (uint d = 0; d < DIMS_PER_LANE; ++d)
+            o[j][d] = 0.0f;
+    }
+    if (!STAGE_K)
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint l0 = c0; l0 < c1; l0 += SIMD) {
+        const uint n = min(SIMD, c1 - l0);
+        if (STAGE_K) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = tid; e < n * (D / 8); e += NSG * SIMD) {
+                const uint row = e / (D / 8), col = (e % (D / 8)) * 8;
+                *(threadgroup uint4*)(ks + row * K_PITCH + col) = *(device const uint4*)(kb + (l0 + row) * position_stride + col);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const uint l = l0 + lane;
+        const bool in_chunk = lane < n;
+        float score[QPS];
+        for (uint j = 0; j < QPS; ++j)
+            score[j] = 0.0f;
+        if (in_chunk) {
+            for (uint c = 0; c < D / 4; ++c) {
+                const float4 kf = STAGE_K ? bf16x4(((threadgroup const uint2*)(ks + lane * K_PITCH))[c])
+                                          : bf16x4(((device const uint2*)(kb + l * position_stride))[c]);
+                for (uint j = 0; j < QPS; ++j)
+                    score[j] += dot(*(threadgroup const float4*)(my_q + j * D + c * 4), kf);
+            }
+        }
+        float p[QPS];
+        for (uint j = 0; j < QPS; ++j) {
+            const uint r = r0 + j, qi = r < G ? r / heads_per_kv : 0;
+            const bool allowed = in_chunk && r < G && mask[(b * Q + qi) * L + l];
+            const float sc = allowed ? score[j] * scale : -INFINITY;
+            const float m_new = max(m[j], simd_max(sc));
+            if (m_new == -INFINITY) {
+                p[j] = 0.0f;
+                continue;
+            }
+            const float rescale = precise::exp(m[j] - m_new);
+            p[j] = allowed ? precise::exp(sc - m_new) : 0.0f;
+            s[j] = s[j] * rescale + simd_sum(p[j]);
+            for (uint d = 0; d < DIMS_PER_LANE; ++d)
+                o[j][d] *= rescale;
+            m[j] = m_new;
+        }
+        for (uint i = 0; i < n; ++i) {
+            float vf[DIMS_PER_LANE];
+            for (uint d = 0; d < DIMS_PER_LANE; ++d)
+                vf[d] = float(vb[(l0 + i) * position_stride + d]);
+            for (uint j = 0; j < QPS; ++j) {
+                const float pj = simd_shuffle(p[j], i);
+                for (uint d = 0; d < DIMS_PER_LANE; ++d)
+                    o[j][d] += pj * vf[d];
+            }
+        }
+    }
+    for (uint j = 0; j < QPS; ++j) {
+        const uint r = r0 + j;
+        if (r >= G)
+            continue;
+        const uint idx = ((b * HKV + kv_head) * G + r) * n_chunks + chunk;
+        if (lane == 0) {
+            part_max[idx] = m[j];
+            part_sum[idx] = s[j];
+        }
+        for (uint d = 0; d < DIMS_PER_LANE; ++d)
+            part_out[idx * D + lane * DIMS_PER_LANE + d] = o[j][d];
+    }
+}
+
+// One simdgroup per (row, kv head, query row); a query with no allowed position gets 0, as SDPA returns on MPS.
+template <uint D>
+inline void merge_attention_chunks(device const float* part_max, device const float* part_sum, device const float* part_out, device bfloat* out,
+                                   uint Q, uint H, uint HKV, uint n_chunks, uint3 tg, uint lane) {
+    constexpr uint DIMS_PER_LANE = D / SIMD;
+    const uint r = tg.x, kv_head = tg.y, b = tg.z;
+    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, qi = r / heads_per_kv, h = kv_head * heads_per_kv + r % heads_per_kv;
+    const uint base = ((b * HKV + kv_head) * G + r) * n_chunks;
+    float m_all = -INFINITY;
+    for (uint c = 0; c < n_chunks; ++c)
+        m_all = max(m_all, part_max[base + c]);
+    float s_all = 0.0f, o_all[DIMS_PER_LANE];
+    for (uint d = 0; d < DIMS_PER_LANE; ++d)
+        o_all[d] = 0.0f;
+    for (uint c = 0; c < n_chunks; ++c) {
+        if (part_max[base + c] == -INFINITY)
+            continue;
+        const float w = precise::exp(part_max[base + c] - m_all);
+        s_all += part_sum[base + c] * w;
+        for (uint d = 0; d < DIMS_PER_LANE; ++d)
+            o_all[d] += part_out[(base + c) * D + lane * DIMS_PER_LANE + d] * w;
+    }
+    for (uint d = 0; d < DIMS_PER_LANE; ++d)
+        out[((b * Q + qi) * H + h) * D + lane * DIMS_PER_LANE + d] = bfloat(s_all > 0.0f ? o_all[d] / s_all : 0.0f);
+}
+
+#define MULTI_QUERY_KERNELS(D, QPS, NSG, STAGE_K) \
+kernel void multi_query_chunk_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], device const bfloat* v [[buffer(2)]], \
+        device const bool* mask [[buffer(3)]], device float* part_max [[buffer(4)]], device float* part_sum [[buffer(5)]], \
+        device float* part_out [[buffer(6)]], constant long& Q [[buffer(7)]], constant long& H [[buffer(8)]], constant long& HKV [[buffer(9)]], \
+        constant long& L [[buffer(10)]], constant long& row_stride [[buffer(11)]], constant float& scale [[buffer(12)]], \
+        constant long& n_chunks [[buffer(13)]], constant long& n_row_groups [[buffer(14)]], uint3 tg [[threadgroup_position_in_grid]], \
+        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup float qs[QPS * NSG * D]; \
+    threadgroup bfloat ks[STAGE_K ? SIMD * (D + 8) : 1]; \
+    multi_query_chunk<D, QPS, NSG, STAGE_K>(q, k, v, mask, part_max, part_sum, part_out, uint(Q), uint(H), uint(HKV), uint(L), uint(row_stride), \
+                                            scale, uint(n_chunks), uint(n_row_groups), tg, sg, lane, tid, qs, ks); \
+} \
+kernel void merge_attention_chunks_##D(device const float* part_max [[buffer(0)]], device const float* part_sum [[buffer(1)]], \
+        device const float* part_out [[buffer(2)]], device bfloat* out [[buffer(3)]], constant long& Q [[buffer(4)]], constant long& H [[buffer(5)]], \
+        constant long& HKV [[buffer(6)]], constant long& n_chunks [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]], \
+        uint lane [[thread_index_in_simdgroup]]) { \
+    merge_attention_chunks<D>(part_max, part_sum, part_out, out, uint(Q), uint(H), uint(HKV), uint(n_chunks), tg, lane); \
+}
+""" + "".join(f"MULTI_QUERY_KERNELS({D}, {qps}, {nsg}, {'true' if stage else 'false'})\n" for D, (qps, nsg, stage) in MULTI_QUERY_CONFIGS.items())
+
+
+def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
+    B, Q, H, D = q.shape
+    length = mask.shape[-1]
+    HKV = k_cache.shape[2]
+    _require("q", q, torch.bfloat16)
+    _require("mask", mask, torch.bool, (B, Q, length))
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
+    if D not in MULTI_QUERY_CONFIGS or H % HKV:
+        raise ValueError(f"unsupported head layout: {H} query heads, {HKV} key/value heads, head dim {D}")
+    qps, nsg, _ = MULTI_QUERY_CONFIGS[D]
+    G = Q * (H // HKV)
+    n_row_groups = -(-G // (qps * nsg))
+    n_chunks = -(-length // CHUNK_POSITIONS)
+    part_max = torch.empty(B * HKV * G * n_chunks, dtype=torch.float32, device=q.device)
+    part_sum = torch.empty_like(part_max)
+    part_out = torch.empty(B * HKV * G * n_chunks * D, dtype=torch.float32, device=q.device)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    getattr(library(), f"multi_query_chunk_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), part_max, part_sum, part_out, Q, H, HKV,
+                                                  length, k_cache.stride(0), scale, n_chunks, n_row_groups,
+                                                  threads=(n_chunks * n_row_groups * nsg * SIMD, HKV, B), group_size=(nsg * SIMD, 1, 1))
+    getattr(library(), f"merge_attention_chunks_{D}")(part_max, part_sum, part_out, out, Q, H, HKV, n_chunks,
+                                                       threads=(G * SIMD, HKV, B), group_size=(SIMD, 1, 1))
+    return out
+
+
+SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION
 _library = None
 
 

@@ -145,28 +145,31 @@ def exact_attention(q, k_cache, v_cache, mask, scale):
 def attention() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(3)
-    for H, HKV, D, Q, L, peak in ((32, 32, 128, 12, 524, 1), (32, 32, 128, 12, 524, 8), (16, 4, 256, 16, 524, 8), (32, 32, 128, 12, 2572, 1),
-                                  (16, 4, 256, 16, 2572, 8)):
-        k_cache, v_cache = (torch.randn(2, L + 40, HKV, D, generator=gen).to(torch.bfloat16) for _ in range(2))
-        q = (torch.randn(1, Q, H, D, generator=gen) * peak).to(torch.bfloat16)
-        full_mask = torch.rand(1, 1, 4 + Q, L, generator=gen) < 0.9
+    cases = [(kernel, 1, *case) for kernel in (metal.cached_attention,) for case in
+             ((32, 32, 128, 12, 524, 1), (32, 32, 128, 12, 524, 8), (16, 4, 256, 16, 524, 8), (32, 32, 128, 12, 2572, 1), (16, 4, 256, 16, 2572, 8))]
+    cases += [(metal.multi_query_attention, 3, *case) for case in ((32, 32, 128, 12, 524, 8), (16, 4, 256, 16, 700, 8), (32, 32, 128, 12, 2572, 1))]
+    for kernel, B, H, HKV, D, Q, L, peak in cases:
+        k_cache, v_cache = (torch.randn(B + 1, L + 40, HKV, D, generator=gen).to(torch.bfloat16) for _ in range(2))
+        q = (torch.randn(B, Q, H, D, generator=gen) * peak).to(torch.bfloat16)
+        full_mask = torch.rand(B, 1, 4 + Q, L, generator=gen) < 0.9
         full_mask[..., 0] = True
         full_mask[0, 0, 4 + 1] = False
         mask = full_mask[:, :, 4:][:, 0]
         exact = exact_attention(q, k_cache, v_cache, mask, D ** -0.5)
         on = lambda t: t.to(MPS)
-        out = metal.cached_attention(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5).cpu()
+        out = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5).cpu()
         live = mask.any(-1)
         sdpa = torch.nn.functional.scaled_dot_product_attention(
-            on(q).transpose(1, 2), on(k_cache[:1, :L]).transpose(1, 2), on(v_cache[:1, :L]).transpose(1, 2), attn_mask=on(mask[:, None]),
+            on(q).transpose(1, 2), on(k_cache[:B, :L]).transpose(1, 2), on(v_cache[:B, :L]).transpose(1, 2), attn_mask=on(mask[:, None]),
             scale=D ** -0.5, enable_gqa=True).transpose(1, 2).cpu()
         rounded = exact.float().to(torch.bfloat16)
         metal_off, sdpa_off = ((t != rounded)[live].float().mean().item() for t in (out, sdpa))
-        print(f"cached_attention H={H} HKV={HKV} D={D} L={L} peak x{peak}: not correctly rounded metal {metal_off:.5f} sdpa {sdpa_off:.5f}")
+        name = f"{kernel.__name__} B={B} H={H} HKV={HKV} D={D} L={L} peak x{peak}"
+        print(f"{name}: not correctly rounded metal {metal_off:.5f} sdpa {sdpa_off:.5f}")
         if metal_off > 1.5 * sdpa_off + 1e-3:
-            failures.append(f"cached_attention D={D} L={L} peak x{peak} rounds worse than SDPA")
+            failures.append(f"{name} rounds worse than SDPA")
         if not torch.equal(out[~live], torch.zeros_like(out[~live])):
-            failures.append("cached_attention gives a nonzero output for a query with no allowed position")
+            failures.append(f"{name} gives a nonzero output for a query with no allowed position")
     return failures
 
 

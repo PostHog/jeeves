@@ -140,9 +140,11 @@ class Engine:
     def cached_attention(self, q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
         B, length = q.shape[0], mask.shape[-1]
         gqa = q.shape[2] != k_cache.shape[2]
-        # On torch 2.14 the Metal kernel beats MPS SDPA for the attention layers at any row count, but for the delta layers' mask queries only up
-        # to 2 rows, because each of their 12 queries per head re-reads the head's whole cache.
-        if self.metal and (gqa or B <= 2):
+        if self.metal:
+            # The single-row kernel re-reads a head's cache for each of its queries, and the multi-query kernel reads it once for all of them.
+            # On torch 2.14 the multi-query kernel wins from 2 rows for the delta layers' 12 queries per head, and from 4 rows for attention.
+            if B >= (4 if gqa else 2):
+                return metal.multi_query_attention(q, k_cache, v_cache, mask[:, 0], scale)
             return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale)
         keys, vals = k_cache[:B, :length], v_cache[:B, :length]
         with sdpa_kernel(EFFICIENT):
