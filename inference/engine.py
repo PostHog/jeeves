@@ -364,23 +364,28 @@ class Engine:
         for p, r in zip(prompts, rems):
             if len(p) + len(r) + len(self.empty_think) + slack > self.L:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
-        P = common_prefix(prompts)
+        budget = opts.max_think if opts.think else 0
+        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
+        P = common_prefix(prompts) if B > 1 else 0
         self.reset(self.bucket(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
-        h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
-        last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
-        first = (self.vocab_logits(last) + self.bias).argmax(-1)
-        budget = opts.max_think if opts.think else 0
-        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
         nothink = None
-        if opts.nothink_threshold is not None or not all(caps):
-            seqs = [self.empty_think + r for r in rems]
-            hn = self.extend(seqs, [len(p) for p in prompts], commit=False)
-            nothink = [self.readout(hn[b], seqs[b]) for b in range(B)]
-            if opts.nothink_threshold is not None:
-                caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
+        if any(caps) or opts.nothink_threshold is not None:
+            h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
+            last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
+            first = (self.vocab_logits(last) + self.bias).argmax(-1)
+            if opts.nothink_threshold is not None or not all(caps):
+                seqs = [self.empty_think + r for r in rems]
+                hn = self.extend(seqs, [len(p) for p in prompts], commit=False)
+                nothink = [self.readout(hn[b], seqs[b]) for b in range(B)]
+                if opts.nothink_threshold is not None:
+                    caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
+        else:
+            tails = [self.empty_think + r for r in rems]
+            hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
+            nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
         chains, closed = [[] for _ in range(B)], [False] * B
         probs = list(nothink) if nothink is not None else [[] for _ in range(B)]
         if any(caps):
