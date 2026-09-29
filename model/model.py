@@ -13,6 +13,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from torch.utils.checkpoint import checkpoint
 
+from . import metal
 from .config import LINEAR, Qwen3_5_9BConfig
 from .lora import LoRAAdapter, LoRAConfig, LoRALinear, inject_lora, mark_only_lora_trainable
 
@@ -90,6 +91,10 @@ def _needs_grad(*xs: torch.Tensor) -> bool:
     return torch.is_grad_enabled() and any(x.requires_grad for x in xs)
 
 
+def _on_metal(*xs: torch.Tensor) -> bool:
+    return _ENABLED_BY_ENV and all(x.is_mps and x.dtype == torch.bfloat16 for x in xs) and not _needs_grad(*xs)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -99,6 +104,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _on("rms_norm", x):
             return _fla_rms_norm(x, 1.0 + self.weight.float(), None, eps=self.eps)
+        if _on_metal(x, self.weight):
+            return metal.rms_norm(x, self.weight, self.eps)
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
         return (xf * (1.0 + self.weight.float())).type_as(x)
@@ -144,6 +151,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 4 and _on_metal(x) and not _needs_grad(cos, sin):
+        return metal.rotary(x, cos, sin)
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     if cos.dim() == 2 and _on("rotary", x):
         return _fla_rotary(x, cos, sin, interleaved=False)

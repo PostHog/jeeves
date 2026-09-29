@@ -5,12 +5,14 @@ import torch
 DK = DV = 128
 SIMD = 32
 BV = 8
+WIDE_ROW_THREADS = 256
+WIDE_ROW_DIM = 2048
 
 SOURCE = f"""
 #include <metal_stdlib>
 using namespace metal;
 
-constant constexpr uint DK = {DK}, DV = {DV}, BV = {BV}, SIMD = {SIMD}, ROWS_PER_LANE = DK / SIMD;
+constant constexpr uint DK = {DK}, DV = {DV}, BV = {BV}, SIMD = {SIMD}, ROWS_PER_LANE = DK / SIMD, WIDE_ROW_THREADS = {WIDE_ROW_THREADS};
 constant constexpr float Q_SCALE = {DK ** -0.5!r}f;
 """ + r"""
 // Metal's exp is biased low near 0 and the state takes one decay factor per token, so small |g| uses a Taylor series exact in fp32.
@@ -94,6 +96,56 @@ kernel void gated_delta_rule_advance(device const bfloat* k [[buffer(0)]], devic
     const uint n_steps = requested <= 0 ? 0u : uint(requested < T ? requested : T);
     gated_delta_rule<false, true>(nullptr, k, v, g, beta, state, nullptr, n_steps, uint(T), uint(H), tg, lane);
 }
+
+// RMSNorm with weight offset 1, as in model.RMSNorm: fp32 mean of squares, rsqrt(mean + eps), times (1 + w), one bf16 rounding.
+inline float rms_norm_value(float x, float inv_rms, bfloat w) {
+    return (x * inv_rms) * (1.0f + float(w));
+}
+
+kernel void rms_norm(device const bfloat* x [[buffer(0)]], device const bfloat* w [[buffer(1)]], device bfloat* out [[buffer(2)]],
+                     constant long& D [[buffer(3)]], constant float& eps [[buffer(4)]],
+                     uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    device const bfloat* xr = x + row * uint(D);
+    float sq = 0.0f;
+    for (uint i = lane; i < uint(D); i += SIMD) { const float v = float(xr[i]); sq += v * v; }
+    const float inv_rms = precise::rsqrt(simd_sum(sq) / float(D) + eps);
+    for (uint i = lane; i < uint(D); i += SIMD)
+        out[row * uint(D) + i] = bfloat(rms_norm_value(float(xr[i]), inv_rms, w[i]));
+}
+
+kernel void rms_norm_wide(device const bfloat* x [[buffer(0)]], device const bfloat* w [[buffer(1)]], device bfloat* out [[buffer(2)]],
+                          constant long& D [[buffer(3)]], constant float& eps [[buffer(4)]],
+                          uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[WIDE_ROW_THREADS / SIMD];
+    device const bfloat* xr = x + row * uint(D);
+    float sq = 0.0f;
+    for (uint i = tid; i < uint(D); i += WIDE_ROW_THREADS) { const float v = float(xr[i]); sq += v * v; }
+    sq = simd_sum(sq);
+    if (lane == 0) partial[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint g = 0; g < WIDE_ROW_THREADS / SIMD; ++g) total += partial[g];
+    const float inv_rms = precise::rsqrt(total / float(D) + eps);
+    for (uint i = tid; i < uint(D); i += WIDE_ROW_THREADS)
+        out[row * uint(D) + i] = bfloat(rms_norm_value(float(xr[i]), inv_rms, w[i]));
+}
+
+// Rotary on the first 2 * half dims of each head. It rounds cos, sin, both products and the sum to bf16, like apply_rotary on bf16 tensors.
+kernel void rotary(device const bfloat* x [[buffer(0)]], device const float* cos_ [[buffer(1)]], device const float* sin_ [[buffer(2)]],
+                   device bfloat* out [[buffer(3)]], constant long& heads [[buffer(4)]], constant long& D [[buffer(5)]],
+                   constant long& rotary_half [[buffer(6)]], uint2 pos [[thread_position_in_grid]]) {
+    const uint d = pos.x, token_head = pos.y, h = uint(rotary_half);
+    const uint idx = token_head * uint(D) + d;
+    if (d >= 2 * h) {
+        out[idx] = x[idx];
+        return;
+    }
+    const uint freq = (token_head / uint(heads)) * h + d % h;
+    const float partner = d < h ? -float(x[idx + h]) : float(x[idx - h]);
+    const float c = float(bfloat(cos_[freq])), s = float(bfloat(sin_[freq]));
+    out[idx] = bfloat(float(bfloat(float(x[idx]) * c)) + float(bfloat(partner * s)));
+}
 """
 
 _library = None
@@ -141,3 +193,32 @@ def gated_delta_rule_advance_inplace(k, v, g, beta, state, steps) -> None:
         raise ValueError(f"steps: expected int64 with at least {B} entries, got {steps.dtype} {tuple(steps.shape)}")
     library().gated_delta_rule_advance(k.contiguous(), v.contiguous(), g.contiguous(), beta.contiguous(), state, steps.contiguous(),
                                        T, H, **_grid(B, H))
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    D = x.shape[-1]
+    _require("weight", weight, torch.bfloat16, (D,))
+    if x.dtype != torch.bfloat16:
+        raise ValueError(f"x: expected torch.bfloat16, got {x.dtype}")
+    x = x.contiguous()
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    rows = x.numel() // D
+    if rows == 0:
+        return out
+    if D >= WIDE_ROW_DIM:
+        library().rms_norm_wide(x, weight, out, D, eps, threads=(WIDE_ROW_THREADS * rows, 1, 1), group_size=(WIDE_ROW_THREADS, 1, 1))
+    else:
+        library().rms_norm(x, weight, out, D, eps, threads=(SIMD * rows, 1, 1), group_size=(SIMD, 1, 1))
+    return out
+
+
+def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    B, T, H, D = x.shape
+    half = cos.shape[-1]
+    if x.dtype != torch.bfloat16 or 2 * half > D:
+        raise ValueError(f"x: expected bfloat16 with at least {2 * half} dims per head, got {x.dtype} {tuple(x.shape)}")
+    cos, sin = (t.float().expand(B, T, half).contiguous() for t in (cos, sin))
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    if x.numel():
+        library().rotary(x.contiguous(), cos, sin, out, H, D, half, threads=(D, B * T * H, 1), group_size=(min(D, 256), 1, 1))
+    return out

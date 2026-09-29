@@ -4,8 +4,8 @@ import sys
 
 import torch
 
-from inference import metal
-from model.model import torch_recurrent_gated_delta_rule
+from model import metal
+from model.model import _rotate_half, torch_recurrent_gated_delta_rule
 
 MPS = torch.device("mps")
 
@@ -90,8 +90,33 @@ def exactness() -> list[str]:
     return failures
 
 
+def norms_and_rotary() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(2)
+    for shape in ((1, 16, 4096), (4, 16, 4096), (1, 180, 4096), (1, 16, 16, 256), (3, 7, 4, 256)):
+        x = (torch.randn(*shape, generator=gen) * 3).to(torch.bfloat16).to(MPS)
+        w = (torch.randn(shape[-1], generator=gen) * 0.1).to(torch.bfloat16).to(MPS)
+        xf = x.float()
+        eager = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * (1.0 + w.float())).to(torch.bfloat16)
+        out = metal.rms_norm(x, w, 1e-6)
+        equal = (out == eager).float().mean().item()
+        worst = ((out.float() - eager.float()).abs() / eager.float().abs().clamp(min=1e-3)).max().item()
+        print(f"rms_norm {shape}: bitwise equal {equal:.5f}, worst relative diff {worst:.2e}")
+        if equal < 0.9999 or worst > 2 ** -7:
+            failures.append(f"rms_norm {shape} differs from the eager formula by more than one bf16 rounding")
+    for B, T, H, D in ((1, 12, 32, 128), (1, 16, 16, 256), (4, 9, 32, 128)):
+        x = torch.randn(B, T, H, D, generator=gen).to(torch.bfloat16).to(MPS)
+        freqs = (torch.arange(T)[None] + torch.randint(0, 3000, (B, 1), generator=gen)).float()[..., None] * torch.logspace(0, -7, 32)
+        cos, sin = freqs.cos().to(MPS), freqs.sin().to(MPS)
+        c, s = (torch.cat((t, t), -1).unsqueeze(-2).to(torch.bfloat16) for t in (cos, sin))
+        eager = torch.cat((x[..., :64] * c + _rotate_half(x[..., :64]) * s, x[..., 64:]), -1)
+        if not torch.equal(metal.rotary(x, cos, sin), eager):
+            failures.append(f"rotary {(B, T, H, D)} is not bitwise equal to apply_rotary")
+    return failures
+
+
 def main() -> None:
-    failures = exactness()
+    failures = exactness() + norms_and_rotary()
     for B, T in ((1, 4), (3, 160), (1, 2048)):
         failures += accuracy(B, T)
     print("\n".join(failures) if failures else "all checks passed")

@@ -11,7 +11,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from export import load_export
 from inference.types import Options, Result
 from model.config import LINEAR
-from inference import metal
+from model import metal
 from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
