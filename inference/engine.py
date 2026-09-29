@@ -97,6 +97,13 @@ class Engine:
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
+        # MPS runs the full-vocabulary matmul about 3x slower than the same matmul in 8 row chunks, which give bitwise-equal logits.
+        self.lm_head_chunks = base.lm_head.weight.chunk(8) if dev.type == "mps" else None
+
+    def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if self.lm_head_chunks is None:
+            return self.base.lm_head(h)
+        return torch.cat([F.linear(h, w) for w in self.lm_head_chunks], dim=-1)
 
     def bucket(self, n: int) -> int:
         b = 1
@@ -229,7 +236,7 @@ class Engine:
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
-        am = (base.lm_head(base.model.norm(x)) + self.bias).argmax(-1)
+        am = (self.vocab_logits(base.model.norm(x)) + self.bias).argmax(-1)
         pred = am[:, :K]
         match = (cand[:, 1:] == pred[:, :-1]).long()
         j = torch.cumprod(match, 1).sum(1) + 1
@@ -345,7 +352,7 @@ class Engine:
             self.broadcast(B, P)
         h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
         last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
-        first = (self.base.lm_head(last) + self.bias).argmax(-1)
+        first = (self.vocab_logits(last) + self.bias).argmax(-1)
         budget = opts.max_think if opts.think else 0
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
         nothink = None
