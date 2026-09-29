@@ -154,10 +154,17 @@ def attention() -> list[str]:
         full_mask = torch.rand(B, 1, 4 + Q, L, generator=gen) < 0.9
         full_mask[..., 0] = True
         full_mask[0, 0, 4 + 1] = False
+        used_end = torch.randint(L // 3, L - 12, (B,), generator=gen)
+        tail_start = L - 12
+        for b, used in enumerate(used_end.tolist()):
+            full_mask[b, :, :, used:tail_start] = False
         mask = full_mask[:, :, 4:][:, 0]
         exact = exact_attention(q, k_cache, v_cache, mask, D ** -0.5)
         on = lambda t: t.to(MPS)
-        out = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5).cpu()
+        out = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5, on(used_end), tail_start).cpu()
+        without_extent = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5).cpu()
+        if ((out.float() - without_extent.float()).abs() > without_extent.float().abs() * 2 ** -7 + 1e-3).any():
+            failures.append(f"{kernel.__name__} D={D} L={L} changes by more than one rounding when it skips the masked gap")
         live = mask.any(-1)
         sdpa = torch.nn.functional.scaled_dot_product_attention(
             on(q).transpose(1, 2), on(k_cache[:B, :L]).transpose(1, 2), on(v_cache[:B, :L]).transpose(1, 2), attn_mask=on(mask[:, None]),

@@ -137,15 +137,15 @@ class Engine:
         else:
             state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
 
-    def cached_attention(self, q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
+    def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor, tail_start: int) -> torch.Tensor:
         B, length = q.shape[0], mask.shape[-1]
         gqa = q.shape[2] != k_cache.shape[2]
         if self.metal:
             # The single-row kernel re-reads a head's cache for each of its queries, and the multi-query kernel reads it once for all of them.
             # On torch 2.14 the multi-query kernel wins from 2 rows for the delta layers' 12 queries per head, and from 4 rows for attention.
             if B >= (4 if gqa else 2):
-                return metal.multi_query_attention(q, k_cache, v_cache, mask[:, 0], scale)
-            return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale)
+                return metal.multi_query_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
+            return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
         keys, vals = k_cache[:B, :length], v_cache[:B, :length]
         with sdpa_kernel(EFFICIENT):
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
@@ -236,6 +236,7 @@ class Engine:
         pos = torch.cat((pos_c, n[:, None] + self.mask_offset[None]), dim=1)
         cos, sin = base.model.rotary_emb(pos)
         cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:]))
+        cache_used = n + K
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
@@ -267,7 +268,7 @@ class Engine:
                 vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
-                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5)
+                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, cache_used, Lw)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
                 o = lin.norm(o.reshape(-1, Dv), z.reshape(-1, Dv)).view(B, K + M, lin.value_dim)
@@ -286,7 +287,7 @@ class Engine:
                 self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
                 self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
-                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling)
+                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, cache_used, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))

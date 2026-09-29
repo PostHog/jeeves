@@ -9,6 +9,11 @@ _HEADER = f"""
 using namespace metal;
 
 constant constexpr uint SIMD = {SIMD};
+""" + r"""
+// Attention visits the used cache positions [0, used) and then the tail [tail_start, L); the positions in between are always masked.
+inline uint visited_position(uint i, uint used, uint tail_start) {
+    return i < used ? i : tail_start + (i - used);
+}
 """
 
 
@@ -255,8 +260,9 @@ constant constexpr uint ATTENTION_SPLITS = {ATTENTION_SPLITS};
 // lanes, and simdgroup 0 merges the shares. A query with no allowed position gets 0, as SDPA returns on MPS.
 template <uint D>
 inline void cached_attention(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
-                             device bfloat* out, uint Q, uint H, uint HKV, uint L, uint row_stride, float scale, uint3 tg, uint sg,
-                             uint lane, threadgroup float* part_max, threadgroup float* part_sum, threadgroup float* part_out) {
+                             device const long* used_end, device bfloat* out, uint Q, uint H, uint HKV, uint L, uint tail_start,
+                             uint row_stride, float scale, uint3 tg, uint sg, uint lane, threadgroup float* part_max,
+                             threadgroup float* part_sum, threadgroup float* part_out) {
     constexpr uint DIMS_PER_LANE = D / SIMD;
     const uint qi = tg.x, h = tg.y, b = tg.z;
     const uint kv_head = h / (H / HKV), out_base = ((b * Q + qi) * H + h) * D + lane * DIMS_PER_LANE;
@@ -268,9 +274,11 @@ inline void cached_attention(device const bfloat* q, device const bfloat* k, dev
     device const bfloat* kb = k + b * row_stride + kv_head * D + lane * DIMS_PER_LANE;
     device const bfloat* vb = v + b * row_stride + kv_head * D + lane * DIMS_PER_LANE;
     device const bool* allowed = mask + (b * Q + qi) * L;
-    const uint share = (L + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS, first = sg * share, last = min(L, first + share);
+    const uint used = min(uint(used_end[b]), tail_start), visited = used + (L - tail_start);
+    const uint share = (visited + ATTENTION_SPLITS - 1) / ATTENTION_SPLITS, first = sg * share, last = min(visited, first + share);
     float m = -INFINITY, s = 0.0f;
-    for (uint l = first; l < last; ++l) {
+    for (uint i = first; i < last; ++i) {
+        const uint l = visited_position(i, used, tail_start);
         if (!allowed[l])
             continue;
         float dot = 0.0f;
@@ -313,31 +321,44 @@ inline void cached_attention(device const bfloat* q, device const bfloat* k, dev
 
 #define CACHED_ATTENTION_KERNEL(D) \
 kernel void cached_attention_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], \
-                                 device const bfloat* v [[buffer(2)]], device const bool* mask [[buffer(3)]], device bfloat* out [[buffer(4)]], \
-                                 constant long& Q [[buffer(5)]], constant long& H [[buffer(6)]], constant long& HKV [[buffer(7)]], \
-                                 constant long& L [[buffer(8)]], constant long& row_stride [[buffer(9)]], constant float& scale [[buffer(10)]], \
+                                 device const bfloat* v [[buffer(2)]], device const bool* mask [[buffer(3)]], device const long* used_end [[buffer(4)]], \
+                                 device bfloat* out [[buffer(5)]], constant long& Q [[buffer(6)]], constant long& H [[buffer(7)]], \
+                                 constant long& HKV [[buffer(8)]], constant long& L [[buffer(9)]], constant long& tail_start [[buffer(10)]], \
+                                 constant long& row_stride [[buffer(11)]], constant float& scale [[buffer(12)]], \
                                  uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
                                  uint lane [[thread_index_in_simdgroup]]) { \
     threadgroup float part_max[ATTENTION_SPLITS], part_sum[ATTENTION_SPLITS], part_out[ATTENTION_SPLITS * D]; \
-    cached_attention<D>(q, k, v, mask, out, uint(Q), uint(H), uint(HKV), uint(L), uint(row_stride), scale, tg, sg, lane, \
-                        part_max, part_sum, part_out); \
+    cached_attention<D>(q, k, v, mask, used_end, out, uint(Q), uint(H), uint(HKV), uint(L), uint(tail_start), uint(row_stride), scale, tg, sg, \
+                        lane, part_max, part_sum, part_out); \
 }
 """ + "".join(f"CACHED_ATTENTION_KERNEL({D})\n" for D in ATTENTION_HEAD_DIMS)
 
 
-def cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
+def _visited_extent(B: int, length: int, used_end: torch.Tensor | None, tail_start: int | None, device) -> tuple[torch.Tensor, int]:
+    if used_end is None:
+        return torch.full((B,), length, dtype=torch.long, device=device), length
+    _require("used_end", used_end, torch.long, (B,))
+    if not 0 <= tail_start <= length:
+        raise ValueError(f"tail_start {tail_start} is outside [0, {length}]")
+    return used_end.contiguous(), tail_start
+
+
+def cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float,
+                     used_end: torch.Tensor | None = None, tail_start: int | None = None) -> torch.Tensor:
     B, Q, H, D = q.shape
     length = mask.shape[-1]
     HKV = k_cache.shape[2]
     _require("q", q, torch.bfloat16)
     _require("mask", mask, torch.bool, (B, Q, length))
+    used_end, tail_start = _visited_extent(B, length, used_end, tail_start, q.device)
     for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
         _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
     if D not in ATTENTION_HEAD_DIMS or H % HKV:
         raise ValueError(f"unsupported head layout: {H} query heads, {HKV} key/value heads, head dim {D}")
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    getattr(library(), f"cached_attention_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), out, Q, H, HKV, length, k_cache.stride(0),
-                                                scale, threads=(SIMD * ATTENTION_SPLITS * Q, H, B), group_size=(SIMD * ATTENTION_SPLITS, 1, 1))
+    getattr(library(), f"cached_attention_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), used_end, out, Q, H, HKV, length, tail_start,
+                                                k_cache.stride(0), scale, threads=(SIMD * ATTENTION_SPLITS * Q, H, B),
+                                                group_size=(SIMD * ATTENTION_SPLITS, 1, 1))
     return out
 
 
@@ -359,8 +380,9 @@ inline float4 bf16x4(uint2 w) {
 // conflicts, or straight from device memory). Values: lanes split D, so value rows are read coalesced. Simdgroup s owns QPS query rows.
 template <uint D, uint QPS, uint NSG, bool STAGE_K>
 inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
-                              device float* part_max, device float* part_sum, device float* part_out, uint Q, uint H, uint HKV, uint L,
-                              uint row_stride, float scale, uint n_chunks, uint n_row_groups, uint3 tg, uint sg, uint lane, uint tid,
+                              device const long* used_end, device float* part_max, device float* part_sum, device float* part_out, uint Q,
+                              uint H, uint HKV, uint L, uint tail_start, uint row_stride, float scale, uint n_chunks, uint n_row_groups,
+                              uint3 tg, uint sg, uint lane, uint tid,
                               threadgroup float* qs, threadgroup bfloat* ks) {
     constexpr uint DIMS_PER_LANE = D / SIMD, K_PITCH = D + 8, ROWS_PER_GROUP = NSG * QPS;
     const uint chunk = tg.x / n_row_groups, row_group = tg.x % n_row_groups, kv_head = tg.y, b = tg.z;
@@ -373,7 +395,8 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
     }
     device const bfloat* kb = k + b * row_stride + kv_head * D;
     device const bfloat* vb = v + b * row_stride + kv_head * D + lane * DIMS_PER_LANE;
-    const uint position_stride = HKV * D, c0 = chunk * CHUNK_POSITIONS, c1 = min(L, c0 + CHUNK_POSITIONS);
+    const uint used = min(uint(used_end[b]), tail_start), visited = used + (L - tail_start);
+    const uint position_stride = HKV * D, c0 = chunk * CHUNK_POSITIONS, c1 = min(visited, c0 + CHUNK_POSITIONS);
     float m[QPS], s[QPS], o[QPS][DIMS_PER_LANE];
     for (uint j = 0; j < QPS; ++j) {
         m[j] = -INFINITY;
@@ -389,11 +412,12 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = tid; e < n * (D / 8); e += NSG * SIMD) {
                 const uint row = e / (D / 8), col = (e % (D / 8)) * 8;
-                *(threadgroup uint4*)(ks + row * K_PITCH + col) = *(device const uint4*)(kb + (l0 + row) * position_stride + col);
+                const uint position = visited_position(l0 + row, used, tail_start);
+                *(threadgroup uint4*)(ks + row * K_PITCH + col) = *(device const uint4*)(kb + position * position_stride + col);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        const uint l = l0 + lane;
+        const uint l = visited_position(l0 + lane, used, tail_start);
         const bool in_chunk = lane < n;
         float score[QPS];
         for (uint j = 0; j < QPS; ++j)
@@ -426,7 +450,7 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
         for (uint i = 0; i < n; ++i) {
             float vf[DIMS_PER_LANE];
             for (uint d = 0; d < DIMS_PER_LANE; ++d)
-                vf[d] = float(vb[(l0 + i) * position_stride + d]);
+                vf[d] = float(vb[visited_position(l0 + i, used, tail_start) * position_stride + d]);
             for (uint j = 0; j < QPS; ++j) {
                 const float pj = simd_shuffle(p[j], i);
                 for (uint d = 0; d < DIMS_PER_LANE; ++d)
@@ -477,14 +501,15 @@ inline void merge_attention_chunks(device const float* part_max, device const fl
 #define MULTI_QUERY_KERNELS(D, QPS, NSG, STAGE_K) \
 kernel void multi_query_chunk_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], device const bfloat* v [[buffer(2)]], \
         device const bool* mask [[buffer(3)]], device float* part_max [[buffer(4)]], device float* part_sum [[buffer(5)]], \
-        device float* part_out [[buffer(6)]], constant long& Q [[buffer(7)]], constant long& H [[buffer(8)]], constant long& HKV [[buffer(9)]], \
-        constant long& L [[buffer(10)]], constant long& row_stride [[buffer(11)]], constant float& scale [[buffer(12)]], \
-        constant long& n_chunks [[buffer(13)]], constant long& n_row_groups [[buffer(14)]], uint3 tg [[threadgroup_position_in_grid]], \
+        device float* part_out [[buffer(6)]], device const long* used_end [[buffer(7)]], constant long& Q [[buffer(8)]], \
+        constant long& H [[buffer(9)]], constant long& HKV [[buffer(10)]], constant long& L [[buffer(11)]], constant long& tail_start [[buffer(12)]], \
+        constant long& row_stride [[buffer(13)]], constant float& scale [[buffer(14)]], constant long& n_chunks [[buffer(15)]], \
+        constant long& n_row_groups [[buffer(16)]], uint3 tg [[threadgroup_position_in_grid]], \
         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup float qs[QPS * NSG * D]; \
     threadgroup bfloat ks[STAGE_K ? SIMD * (D + 8) : 1]; \
-    multi_query_chunk<D, QPS, NSG, STAGE_K>(q, k, v, mask, part_max, part_sum, part_out, uint(Q), uint(H), uint(HKV), uint(L), uint(row_stride), \
-                                            scale, uint(n_chunks), uint(n_row_groups), tg, sg, lane, tid, qs, ks); \
+    multi_query_chunk<D, QPS, NSG, STAGE_K>(q, k, v, mask, used_end, part_max, part_sum, part_out, uint(Q), uint(H), uint(HKV), uint(L), \
+                                            uint(tail_start), uint(row_stride), scale, uint(n_chunks), uint(n_row_groups), tg, sg, lane, tid, qs, ks); \
 } \
 kernel void merge_attention_chunks_##D(device const float* part_max [[buffer(0)]], device const float* part_sum [[buffer(1)]], \
         device const float* part_out [[buffer(2)]], device bfloat* out [[buffer(3)]], constant long& Q [[buffer(4)]], constant long& H [[buffer(5)]], \
@@ -495,12 +520,14 @@ kernel void merge_attention_chunks_##D(device const float* part_max [[buffer(0)]
 """ + "".join(f"MULTI_QUERY_KERNELS({D}, {qps}, {nsg}, {'true' if stage else 'false'})\n" for D, (qps, nsg, stage) in MULTI_QUERY_CONFIGS.items())
 
 
-def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
+def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float,
+                          used_end: torch.Tensor | None = None, tail_start: int | None = None) -> torch.Tensor:
     B, Q, H, D = q.shape
     length = mask.shape[-1]
     HKV = k_cache.shape[2]
     _require("q", q, torch.bfloat16)
     _require("mask", mask, torch.bool, (B, Q, length))
+    used_end, tail_start = _visited_extent(B, length, used_end, tail_start, q.device)
     for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
         _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
     if D not in MULTI_QUERY_CONFIGS or H % HKV:
@@ -513,8 +540,8 @@ def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch
     part_sum = torch.empty_like(part_max)
     part_out = torch.empty(B * HKV * G * n_chunks * D, dtype=torch.float32, device=q.device)
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    getattr(library(), f"multi_query_chunk_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), part_max, part_sum, part_out, Q, H, HKV,
-                                                  length, k_cache.stride(0), scale, n_chunks, n_row_groups,
+    getattr(library(), f"multi_query_chunk_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), part_max, part_sum, part_out, used_end, Q,
+                                                  H, HKV, length, tail_start, k_cache.stride(0), scale, n_chunks, n_row_groups,
                                                   threads=(n_chunks * n_row_groups * nsg * SIMD, HKV, B), group_size=(nsg * SIMD, 1, 1))
     getattr(library(), f"merge_attention_chunks_{D}")(part_max, part_sum, part_out, out, Q, H, HKV, n_chunks,
                                                        threads=(G * SIMD, HKV, B), group_size=(SIMD, 1, 1))
