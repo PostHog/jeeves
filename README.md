@@ -283,36 +283,11 @@ If you use Jeeves, its training recipe or its drafter, please cite:
 
 ## References
 
-Model
-
-- Qwen Team. [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B), the base model. See also [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388), 2025.
+- [Jev's Architecture Unmasked](https://archerhume.com/posts/jevs-architecture-unmasked), the Jev design that Kev and Jeeves follow.
+- Qwen Team. [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B), the base model.
 - Yang, Kautz, Hatamizadeh. [Gated Delta Networks: Improving Mamba2 with Delta Rule](https://arxiv.org/abs/2412.06464). ICLR 2025.
-- Yang, Wang, Zhang, Shen, Kim. [Parallelizing Linear Transformers with the Delta Rule over Sequence Length](https://arxiv.org/abs/2406.06484). NeurIPS 2024. Kernels from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention).
-- Qiu et al. [Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free](https://arxiv.org/abs/2505.06708). 2025.
 - Hu et al. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685). ICLR 2022.
-- Vinyals, Fortunato, Jaitly. [Pointer Networks](https://arxiv.org/abs/1506.03134). NeurIPS 2015.
-- [Jev's Architecture Unmasked](https://archerhume.com/posts/jevs-architecture-unmasked), the description of Jev's design that Kev and this project follow.
-
-Training
-
 - MiniMax. [MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention](https://arxiv.org/abs/2506.13585). 2025. Introduces CISPO.
-- Shao et al. [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models](https://arxiv.org/abs/2402.03300). 2024. Group-relative advantages (GRPO).
 - Guo, Pleiss, Sun, Weinberger. [On Calibration of Modern Neural Networks](https://arxiv.org/abs/1706.04599). ICML 2017. Temperature scaling.
-- Naeini, Cooper, Hauskrecht. [Obtaining Well Calibrated Probabilities Using Bayesian Binning](https://ojs.aaai.org/index.php/AAAI/article/view/9602). AAAI 2015. Expected calibration error.
-
-Drafting and inference
-
+- [Orthrus](https://arxiv.org/abs/2605.12825), arXiv 2605.12825. The diffusion drafter ours adapts to Gated DeltaNet.
 - Leviathan, Kalman, Matias. [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192). ICML 2023.
-- Chen et al. [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318). 2023.
-- [Orthrus](https://arxiv.org/abs/2605.12825), arXiv 2605.12825. The diffusion-drafter design ours adapts to Gated DeltaNet.
-- Stern, Shazeer, Uszkoreit. [Blockwise Parallel Decoding for Deep Autoregressive Models](https://arxiv.org/abs/1811.03115). NeurIPS 2018.
-- Cai et al. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774). ICML 2024.
-- Zhou et al. [DistillSpec: Improving Speculative Decoding via Knowledge Distillation](https://arxiv.org/abs/2310.08461). ICLR 2024.
-- Hinton, Vinyals, Dean. [Distilling the Knowledge in a Neural Network](https://arxiv.org/abs/1503.02531). 2015.
-- Micikevicius et al. [FP8 Formats for Deep Learning](https://arxiv.org/abs/2209.05433). 2022.
-
-Evaluation
-
-- Hendrycks et al. [Measuring Massive Multitask Language Understanding](https://arxiv.org/abs/2009.03300). ICLR 2021.
-- Wang et al. [MMLU-Pro: A More Robust and Challenging Multi-Task Language Understanding Benchmark](https://arxiv.org/abs/2406.01574). NeurIPS 2024.
-- Dataset revisions for every training and evaluation source are pinned in `data/manifest.json`.
