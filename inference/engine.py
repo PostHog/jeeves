@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -20,6 +21,10 @@ EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 
 def delta_step(q, k, v, g, beta, state, final: bool):
     return gated_delta_rule_step(q, k, v, g, beta, initial_state=state, output_final_state=final)
+
+
+def store_transposed(linear: nn.Linear) -> None:
+    linear.weight = nn.Parameter(linear.weight.t().contiguous().t(), requires_grad=False)
 
 
 def common_prefix(seqs: list[list[int]]) -> int:
@@ -52,6 +57,14 @@ class Engine:
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
+        if self.metal:
+            # MPS multiplies 12 or more input rows faster, with bitwise-equal results, by transposed weight storage; the 4-row candidate projections get slower, so they keep theirs.
+            for layer in base.model.layers:
+                mixer = (layer.linear_attn.in_proj_z, layer.linear_attn.out_proj) if layer.layer_type == LINEAR else (layer.self_attn.o_proj,)
+                for proj in (*mixer, layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+                    store_transposed(proj)
+            for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
+                store_transposed(proj)
         torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.fp8 = fp8
