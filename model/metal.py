@@ -212,6 +212,41 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return out
 
 
+# Gated RMSNorm: one simdgroup per row, as in model.GatedRMSNorm.
+
+_GATED_RMS_NORM = r"""
+// Must round like model.GatedRMSNorm's eager path: the normalised value, its product with the weight, and the product with silu(z).
+// MPS evaluates silu(z) as z / (1 + exp(-z)); the other algebraic forms round differently.
+kernel void gated_rms_norm(device const bfloat* x [[buffer(0)]], device const bfloat* z [[buffer(1)]], device const bfloat* w [[buffer(2)]],
+                           device bfloat* out [[buffer(3)]], constant long& D [[buffer(4)]], constant float& eps [[buffer(5)]],
+                           uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    device const bfloat* xr = x + row * uint(D);
+    device const bfloat* zr = z + row * uint(D);
+    float sq = 0.0f;
+    for (uint i = lane; i < uint(D); i += SIMD) { const float v = float(xr[i]); sq += v * v; }
+    const float inv_rms = precise::rsqrt(simd_sum(sq) / float(D) + eps);
+    for (uint i = lane; i < uint(D); i += SIMD) {
+        const bfloat normed = bfloat(float(xr[i]) * inv_rms);
+        const bfloat weighted = bfloat(float(w[i]) * float(normed));
+        const float zf = float(zr[i]);
+        out[row * uint(D) + i] = bfloat(float(weighted) * (zf / (1.0f + precise::exp(-zf))));
+    }
+}
+"""
+
+
+def gated_rms_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    D = x.shape[-1]
+    _require("x", x, torch.bfloat16)
+    _require("z", z, torch.bfloat16, tuple(x.shape))
+    _require("weight", weight, torch.bfloat16, (D,))
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    rows = x.numel() // D if D else 0
+    if rows:
+        library().gated_rms_norm(x.contiguous(), z.contiguous(), weight.contiguous(), out, D, eps, threads=(SIMD * rows, 1, 1), group_size=(SIMD, 1, 1))
+    return out
+
+
 # Rotary: one thread per element of x.
 
 ROTARY_GROUP = 256
@@ -548,7 +583,7 @@ def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch
     return out
 
 
-SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION
+SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _GATED_RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION
 _library = None
 
 

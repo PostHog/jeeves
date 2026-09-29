@@ -5,7 +5,7 @@ import sys
 import torch
 
 from model import metal
-from model.model import RMSNorm, apply_rotary, set_kernels, torch_recurrent_gated_delta_rule
+from model.model import GatedRMSNorm, RMSNorm, apply_rotary, set_kernels, torch_recurrent_gated_delta_rule
 
 MPS = torch.device("mps")
 
@@ -118,6 +118,22 @@ def norms() -> list[str]:
 
 
 @torch.no_grad()
+def gated_norm() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(5)
+    for rows, scale in ((512, 2.0), (1536, 2.0), (64, 1e-3)):
+        norm = GatedRMSNorm(128).to(MPS, torch.bfloat16)
+        norm.weight.copy_(torch.rand(128, generator=gen) + 0.5)
+        x, z = ((torch.randn(rows, 128, generator=gen) * s).to(torch.bfloat16).to(MPS) for s in (scale, 3.0))
+        eager, out = eager_then_metal(lambda: norm(x, z))
+        equal = (out == eager).float().mean().item()
+        print(f"GatedRMSNorm rows={rows} x~{scale}: bitwise equal to eager {equal:.6f}")
+        if equal < 0.9999 or ((out.float() - eager.float()).abs() > eager.float().abs() * torch.finfo(torch.bfloat16).eps + 1e-30).any():
+            failures.append(f"GatedRMSNorm rows={rows} x~{scale} differs from eager by more than one bf16 rounding")
+    return failures
+
+
+@torch.no_grad()
 def rotary() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(4)
@@ -181,7 +197,7 @@ def attention() -> list[str]:
 
 
 def main() -> None:
-    failures = exactness() + norms() + rotary() + attention()
+    failures = exactness() + norms() + gated_norm() + rotary() + attention()
     for B, T in ((1, 4), (3, 160), (1, 2048)):
         failures += accuracy(B, T)
     print("\n".join(failures) if failures else "all checks passed")
