@@ -30,26 +30,26 @@ This results in better performance on out of domain tasks, and outperforms Jev i
 
 ## Results
 
-Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise. The best result in each row is highlighted in green.
+Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes; only JevBench uses the same items for every model, so gaps under about 5 points on the other rows are within noise. The best result in each row is in bold.
 
 | bench                                            | Kev-9B                          | Jev                             | Jeeves                          |
 | ------------------------------------------------ | ------------------------------- | ------------------------------- | ------------------------------- |
-| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                           | 0.857                           | ![0.889](https://img.shields.io/badge/-0.889-2ea043?style=flat-square) |
-| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | ![0.800](https://img.shields.io/badge/-0.800-2ea043?style=flat-square) | 0.746                           |
-| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | ![0.935](https://img.shields.io/badge/-0.935-2ea043?style=flat-square) |
-| QNLI                                             | ![0.925](https://img.shields.io/badge/-0.925-2ea043?style=flat-square) | ![0.925](https://img.shields.io/badge/-0.925-2ea043?style=flat-square) | 0.913                           |
-| SciQ                                             | 0.963                           | 0.988                           | ![0.991](https://img.shields.io/badge/-0.991-2ea043?style=flat-square) |
-| TweetEval offensive                              | 0.775                           | ![0.813](https://img.shields.io/badge/-0.813-2ea043?style=flat-square) | ![0.813](https://img.shields.io/badge/-0.813-2ea043?style=flat-square) |
-| PAWS                                             | 0.763                           | 0.788                           | ![0.875](https://img.shields.io/badge/-0.875-2ea043?style=flat-square) |
-| MMLU                                             | 0.738                           | ![0.900](https://img.shields.io/badge/-0.900-2ea043?style=flat-square) | 0.793                           |
-| Emotion                                          | 0.600                           | 0.588                           | ![0.647](https://img.shields.io/badge/-0.647-2ea043?style=flat-square) |
-| Held-out rule structures                         | 0.896                           | 0.885                           | ![1.000](https://img.shields.io/badge/-1.000-2ea043?style=flat-square) |
-| Contrastive policies                             | 0.900                           | 0.963                           | ![1.000](https://img.shields.io/badge/-1.000-2ea043?style=flat-square) |
-| MMLU-Pro (10-way)                                | 0.515                           | ![0.840](https://img.shields.io/badge/-0.840-2ea043?style=flat-square) | 0.739                           |
-| Buried state                                     | 0.740                           | 0.700                           | ![0.759](https://img.shields.io/badge/-0.759-2ea043?style=flat-square) |
-| Unknowable answered at p ≥ 0.9 (lower is better) | ![0.000](https://img.shields.io/badge/-0.000-2ea043?style=flat-square) | 0.090                           | 0.055                           |
-| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | ![0.865](https://img.shields.io/badge/-0.865-2ea043?style=flat-square) |
-| JevBench ECE (public items)                      |                                 | 0.049                           | ![0.037](https://img.shields.io/badge/-0.037-2ea043?style=flat-square) |
+| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                           | 0.857                           | **0.889** |
+| **Transfer overall** (MMLU-Pro and buried state) | 0.579                           | **0.800** | 0.746                           |
+| **JevBench overall** (231 public items)          | 0.715\*                         | 0.866                           | **0.935** |
+| QNLI                                             | **0.925** | **0.925** | 0.913                           |
+| SciQ                                             | 0.963                           | 0.988                           | **0.991** |
+| TweetEval offensive                              | 0.775                           | **0.813** | **0.813** |
+| PAWS                                             | 0.763                           | 0.788                           | **0.875** |
+| MMLU                                             | 0.738                           | **0.900** | 0.793                           |
+| Emotion                                          | 0.600                           | 0.588                           | **0.647** |
+| Held-out rule structures                         | 0.896                           | 0.885                           | **1.000** |
+| Contrastive policies                             | 0.900                           | 0.963                           | **1.000** |
+| MMLU-Pro (10-way)                                | 0.515                           | **0.840** | 0.739                           |
+| Buried state                                     | 0.740                           | 0.700                           | **0.759** |
+| Unknowable answered at p ≥ 0.9 (lower is better) | **0.000** | 0.090                           | 0.055                           |
+| JevBench hard (111 public items)                 | 0.451\*                         | 0.730                           | **0.865** |
+| JevBench ECE (public items)                      |                                 | 0.049                           | **0.037** |
 
 \* No Kev-9B JevBench result is published; these are Kev-8B (Qwen3).
 
