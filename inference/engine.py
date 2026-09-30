@@ -49,22 +49,23 @@ class Engine:
         if fp8 and not fp8_supported:
             raise ValueError("precision='fp8' needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels enabled "
                              "(unset QWEN35_KERNELS=0)")
-        base, head, encoder = load_export(model, device=dev)
-        view = DrafterView(base, block=block).to(dev)
-        loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
-        missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
-        if loaded.unexpected_keys or missing:
-            raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
-        view.requires_grad_(False)
-        self.dtype = base.lm_head.weight.dtype
-        if fp8 and self.mps:
-            from inference.fp8_metal import quantize
-            quantize(view)
-        elif fp8:
-            from inference.fp8 import quantize, warm
-            quantize(view)
-            warm(view)
+        if fp8:
+            if self.mps:
+                from inference.fp8_metal import load_view
+            else:
+                from inference.fp8 import load_view
+            view, head, encoder = load_view(model, drafter, block, dev)
+            base = view.base
+            self.dtype = base.model.embed_tokens.weight.dtype
         else:
+            base, head, encoder = load_export(model, device=dev)
+            view = DrafterView(base, block=block).to(dev)
+            loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
+            missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
+            if loaded.unexpected_keys or missing:
+                raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
+            view.requires_grad_(False)
+            self.dtype = base.lm_head.weight.dtype
             for proj in view.projections():
                 proj.to(self.dtype)
         if self.mps and not fp8 and torch.backends.mps.is_macos_or_newer(15, 0):

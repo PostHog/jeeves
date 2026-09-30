@@ -84,17 +84,25 @@ def main() -> None:
                       "total_gb": round(index["metadata"]["total_size"] / 2**30, 2)}))
 
 
-def load_export(path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> tuple[Qwen3_5ForCausalLM, PointerHead, Encoder]:
-    path = Path(path)
-    if not path.is_dir():
-        path = Path(snapshot_download(str(path)))
+def export_dir(path: str) -> Path:
+    return Path(path) if Path(path).is_dir() else Path(snapshot_download(path))
+
+
+def load_head(path: Path, hidden_size: int, device: str | torch.device) -> PointerHead:
     meta = json.loads((path / "export.json").read_text())
-    model = Qwen3_5ForCausalLM.from_pretrained(str(path), cfg=Qwen3_5_9BConfig.from_json(path / "config.json"), device=device, dtype=dtype)
-    head = PointerHead(model.cfg.hidden_size, meta["head_dim"]).to(device)
+    head = PointerHead(hidden_size, meta["head_dim"]).to(device)
     head.load_state_dict(torch.load(path / "head.pt", map_location=device))
     head.temperature = float(meta.get("temperature", 1.0))
-    head.eval()
-    return model, head, Encoder(str(path))
+    return head.eval()
+
+
+def load_export(path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> tuple[Qwen3_5ForCausalLM, PointerHead, Encoder]:
+    path = export_dir(path)
+    precision = json.loads((path / "export.json").read_text()).get("precision", "bf16")
+    if precision != "bf16":
+        raise ValueError(f"{path} stores {precision} weights; serve it with precision={precision!r}")
+    model = Qwen3_5ForCausalLM.from_pretrained(str(path), cfg=Qwen3_5_9BConfig.from_json(path / "config.json"), device=device, dtype=dtype)
+    return model, load_head(path, model.cfg.hidden_size, device), Encoder(str(path))
 
 
 if __name__ == "__main__":

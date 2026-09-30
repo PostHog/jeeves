@@ -5,7 +5,11 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from inference.fp8_weights import FP8, FP8_MAX, quantize_rows, replace_linears
+from drafter.view import DrafterView
+from inference.fp8_checkpoint import load_fp8_view
+from inference.fp8_weights import FP8, FP8_MAX, quantize_rows
+from loader.dataloader import Encoder
+from model import PointerHead
 
 CONFIGS = [triton.Config({"BLOCK_N": n, "BLOCK_M": m, "BLOCK_K": k}, num_warps=w, num_stages=st)
            for n in (32, 64, 128) for m in (16, 32, 64, 128) for k in (128, 256) for w, st in ((4, 4), (8, 3))
@@ -50,14 +54,22 @@ def split_for(N: int, K: int) -> int:
 
 
 class FP8Linear(nn.Module):
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, device: torch.device | str | None = None):
         super().__init__()
-        weight, scale = quantize_rows(linear.weight)
-        self.register_buffer("weight", weight)
-        self.register_buffer("scale", scale)
-        self.bias = None if linear.bias is None else nn.Parameter(linear.bias.detach().to(torch.bfloat16), requires_grad=False)
-        self.in_features, self.out_features = linear.in_features, linear.out_features
+        self.register_buffer("weight", torch.empty(out_features, in_features, dtype=FP8, device=device))
+        self.register_buffer("scale", torch.empty(out_features, dtype=torch.float32, device=device))
+        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16, device=device), requires_grad=False) if bias else None
+        self.in_features, self.out_features = in_features, out_features
         self.split = split_for(self.out_features, self.in_features)
+
+    @torch.no_grad()
+    def load_codes(self, codes: torch.Tensor, scale: torch.Tensor) -> None:
+        self.weight.copy_(codes)
+        self.scale.copy_(scale)
+
+    @torch.no_grad()
+    def load_weight(self, weight: torch.Tensor) -> None:
+        self.load_codes(*quantize_rows(weight.to(self.weight.device)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
@@ -83,8 +95,10 @@ class FP8Linear(nn.Module):
         return y.view(*shape[:-1], N)
 
 
-def quantize(module: nn.Module) -> int:
-    return replace_linears(module, FP8Linear)
+def load_view(model: str, drafter: str, block: int, device: torch.device) -> tuple[DrafterView, PointerHead, Encoder]:
+    view, head, encoder = load_fp8_view(model, drafter, block, device, FP8Linear)
+    warm(view)
+    return view, head, encoder
 
 
 @torch.no_grad()

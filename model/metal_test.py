@@ -5,7 +5,7 @@ import sys
 import torch
 
 from inference.fp8_metal import MetalFP8Linear, check_kernel_on_every_code
-from inference.fp8_weights import quantize_rows
+from inference.fp8_weights import QUANTIZE_BLOCK_ROWS, quantize_rows
 from model import metal
 from model.model import GatedRMSNorm, RMSNorm, apply_rotary, set_kernels, torch_recurrent_gated_delta_rule
 
@@ -226,13 +226,19 @@ def fp8() -> list[str]:
             failures.append(f"fp8_linear accepted K={K} N={N}")
         except ValueError:
             pass
-    linear = torch.nn.Linear(4096, 1024 + 16, bias=True, dtype=torch.bfloat16)
+    linear = torch.nn.Linear(4096, QUANTIZE_BLOCK_ROWS + 16, bias=True, dtype=torch.bfloat16)
     codes, scale = quantize_rows(linear.weight)
-    quantized = MetalFP8Linear(linear.to(MPS))
+    quantized = MetalFP8Linear(linear.in_features, linear.out_features, bias=True, device=MPS)
+    quantized.load_weight(linear.weight)
+    quantized.bias.copy_(linear.bias)
+    stored = MetalFP8Linear(linear.in_features, linear.out_features, device=MPS)
+    stored.load_codes(codes, scale)
     x = torch.randn(3, 4096, generator=gen).to(torch.bfloat16).to(MPS)
     if not torch.equal(quantized.codes.cpu(), codes.view(torch.uint8)) or not torch.equal(quantized.scale.cpu(), scale):
-        failures.append("MetalFP8Linear's codes or scales differ from quantize_rows")
-    if not torch.equal(quantized(x), metal.fp8_linear(x, quantized.codes, quantized.scale) + linear.bias):
+        failures.append("MetalFP8Linear.load_weight's codes or scales differ from quantize_rows")
+    if not torch.equal(stored.codes, quantized.codes) or not torch.equal(stored.scale, quantized.scale):
+        failures.append("MetalFP8Linear.load_codes does not keep the codes and scales it is given")
+    if not torch.equal(quantized(x), metal.fp8_linear(x, quantized.codes, quantized.scale) + linear.bias.to(MPS)):
         failures.append("MetalFP8Linear does not add its bias to fp8_linear")
     return failures
 
