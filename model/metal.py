@@ -623,7 +623,8 @@ inline void fp8x4_times_2_pow_minus_8(uint word, thread float2& even, thread flo
 }
 
 // Each lane loads 16 contiguous code bytes of one feature per 64-k block and uses bytes 2q and 2q + 1 as its fragment of k tile q.
-// The x fragments follow the same permutation of k within the block, so the dot products are unchanged.
+// The x fragments follow the same permutation of k within the block, so the dot products are unchanged. The codes come in the order
+// of tile_fp8_codes, so a simdgroup's two code loads per block each read 512 contiguous bytes.
 template <bool PARTIAL>
 inline void fp8_linear_tile(device const bfloat* x, device const uchar* w, device const float* scale, device void* y,
                             uint M, uint N, uint K, uint k_per_part, uint3 tg, uint sg, uint sgs, uint lane) {
@@ -636,12 +637,12 @@ inline void fp8_linear_tile(device const bfloat* x, device const uchar* w, devic
     const uint x_offset = 8 * (frag_row & ~1u) + (frag_row & 1u);
     device const bfloat* x0 = x + ulong(min(m0 + frag_col, M - 1)) * K + x_offset;
     device const bfloat* x1 = x + ulong(min(m0 + frag_col + 1, M - 1)) * K + x_offset;
-    device const uchar* w0 = w + ulong(n0 + frag_row) * K + 8 * frag_col;
-    device const uchar* w1 = w0 + 8 * ulong(K);
+    device const uchar* w0 = w + ulong(n0) * K + 16 * lane;
+    device const uchar* w1 = w0 + 16 * SIMD;
     simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f), acc1 = simdgroup_float8x8(0.0f);
     for (uint k0 = part * k_per_part; k0 < (part + 1) * k_per_part; k0 += FP8_BLOCK_K) {
-        const uint4 codes0 = *(device const uint4*)(w0 + k0);
-        const uint4 codes1 = *(device const uint4*)(w1 + k0);
+        const uint4 codes0 = *(device const uint4*)(w0 + FP8_TILE_FEATURES * k0);
+        const uint4 codes1 = *(device const uint4*)(w1 + FP8_TILE_FEATURES * k0);
         for (uint p = 0; p < 4; ++p) {
             float2 even0, odd0, even1, odd1;
             fp8x4_times_2_pow_minus_8(codes0[p], even0, odd0);
@@ -701,14 +702,22 @@ kernel void fp8_linear_merge(device const float* parts [[buffer(0)]], device con
 """
 
 
-def fp8_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def tile_fp8_codes(codes: torch.Tensor) -> torch.Tensor:
     N, K = codes.shape
+    # Row 16f + 8t + 4b4 + 2b2 + b1 and k = 64kb + 16(2b3 + b0) + j are byte j of lane 16b4 + 8b3 + 4b2 + 2b1 + b0's load t in tile (f, kb).
+    by_lane = codes.reshape(N // 16, 2, 2, 2, 2, K // 64, 2, 2, 16).permute(0, 5, 1, 2, 6, 3, 4, 7, 8)
+    return by_lane.contiguous().view(N, K)
+
+
+def fp8_linear(x: torch.Tensor, tiled_codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    N, K = tiled_codes.shape
     _require("x", x, torch.bfloat16)
-    _require("codes", codes, torch.uint8, (N, K))
+    _require("tiled_codes", tiled_codes, torch.uint8, (N, K))
     _require("scale", scale, torch.float32, (N,))
-    if x.shape[-1] != K or K % (FP8_BLOCK_K * FP8_K_SPLITS) or N % FP8_TILE_FEATURES or not codes.is_contiguous() or codes.storage_offset() % 16:
+    if (x.shape[-1] != K or K % (FP8_BLOCK_K * FP8_K_SPLITS) or N % FP8_TILE_FEATURES or not tiled_codes.is_contiguous()
+            or tiled_codes.storage_offset() % 16):
         raise ValueError(f"fp8_linear: needs x (..., {K}), K a multiple of {FP8_BLOCK_K * FP8_K_SPLITS}, N a multiple of {FP8_TILE_FEATURES} "
-                         f"and 16-byte aligned contiguous codes; got x {tuple(x.shape)}, codes {tuple(codes.shape)}")
+                         f"and 16-byte aligned contiguous codes; got x {tuple(x.shape)}, codes {tuple(tiled_codes.shape)}")
     x2 = x.reshape(-1, K).contiguous()
     M = x2.shape[0]
     out = torch.empty(*x.shape[:-1], N, dtype=torch.bfloat16, device=x.device)
@@ -722,10 +731,10 @@ def fp8_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor) -> tor
     grid = {"threads": (groups * FP8_SIMDGROUPS * SIMD, splits, row_tiles), "group_size": (FP8_SIMDGROUPS * SIMD, 1, 1)}
     scale = scale.contiguous()
     if splits == 1:
-        library().fp8_linear(x2, codes, scale, out, M, N, K, **grid)
+        library().fp8_linear(x2, tiled_codes, scale, out, M, N, K, **grid)
         return out
     parts = torch.empty(splits, M, N, dtype=torch.float32, device=x.device)
-    library().fp8_linear_partial(x2, codes, scale, parts, M, N, K, K // splits, **grid)
+    library().fp8_linear_partial(x2, tiled_codes, scale, parts, M, N, K, K // splits, **grid)
     library().fp8_linear_merge(parts, scale, out, M * N, N, splits, threads=(M * N, 1, 1), group_size=(FP8_MERGE_THREADS, 1, 1))
     return out
 

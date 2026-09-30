@@ -211,7 +211,7 @@ def fp8() -> list[str]:
         w8, scale = quantize_rows(torch.randn(N, K, generator=gen) * 0.02)
         x = torch.randn(*shape, K, generator=gen).to(torch.bfloat16)
         triton_w8a16_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
-        out = metal.fp8_linear(x.to(MPS), w8.view(torch.uint8).to(MPS), scale.to(MPS)).cpu()
+        out = metal.fp8_linear(x.to(MPS), metal.tile_fp8_codes(w8.view(torch.uint8)).to(MPS), scale.to(MPS)).cpu()
         weights = w8.double() * scale.double()[:, None]
         exact, magnitude = x.double() @ weights.t(), x.double().abs() @ weights.abs().t()
         equal = (out == triton_w8a16_math).float().mean().item()
@@ -234,11 +234,11 @@ def fp8() -> list[str]:
     stored = MetalFP8Linear(linear.in_features, linear.out_features, device=MPS)
     stored.load_codes(codes, scale)
     x = torch.randn(3, 4096, generator=gen).to(torch.bfloat16).to(MPS)
-    if not torch.equal(quantized.codes.cpu(), codes.view(torch.uint8)) or not torch.equal(quantized.scale.cpu(), scale):
+    if not torch.equal(quantized.tiled_codes.cpu(), metal.tile_fp8_codes(codes.view(torch.uint8))) or not torch.equal(quantized.scale.cpu(), scale):
         failures.append("MetalFP8Linear.load_weight's codes or scales differ from quantize_rows")
-    if not torch.equal(stored.codes, quantized.codes) or not torch.equal(stored.scale, quantized.scale):
+    if not torch.equal(stored.tiled_codes, quantized.tiled_codes) or not torch.equal(stored.scale, quantized.scale):
         failures.append("MetalFP8Linear.load_codes does not keep the codes and scales it is given")
-    if not torch.equal(quantized(x), metal.fp8_linear(x, quantized.codes, quantized.scale) + linear.bias.to(MPS)):
+    if not torch.equal(quantized(x), metal.fp8_linear(x, quantized.tiled_codes, quantized.scale) + linear.bias.to(MPS)):
         failures.append("MetalFP8Linear does not add its bias to fp8_linear")
     return failures
 
