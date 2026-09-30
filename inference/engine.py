@@ -12,7 +12,7 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
+from model.model import KERNELS, RMSNorm, apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -99,6 +99,13 @@ class Engine:
             for group in groups:
                 if (merged := concatenated_linears(group)) is not None:
                     self.merged[id(group[0])] = merged
+        # Each RMSNorm call on CUDA would rebuild its float32 1 + weight, and each delta layer its decay, so both are built once here.
+        self.shifted_norm_weights: dict[int, torch.Tensor] = {}
+        if dev.type == "cuda" and KERNELS["rms_norm"]:
+            from fla.modules.layernorm import rms_norm as fla_rms_norm
+            self.fla_rms_norm = fla_rms_norm
+            self.shifted_norm_weights = {id(m): 1.0 + m.weight.float() for m in base.modules() if isinstance(m, RMSNorm)}
+        self.decays = {i: -layer.linear_attn.A_log.float().exp() for i, layer in enumerate(base.model.layers) if layer.layer_type == LINEAR}
         torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.cfg = cfg = base.cfg
@@ -188,6 +195,10 @@ class Engine:
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
                                                   enable_gqa=gqa).transpose(1, 2)
 
+    def rms_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        shifted = self.shifted_norm_weights.get(id(norm))
+        return norm(x) if shifted is None else self.fla_rms_norm(x, shifted, None, eps=norm.eps)
+
     def project(self, x: torch.Tensor, *linears: nn.Module) -> tuple[torch.Tensor, ...]:
         merged = self.merged.get(id(linears[0]))
         if merged is None:
@@ -272,7 +283,7 @@ class Engine:
         keep = valid.float()[..., None]
         x = base.model.embed_tokens(ids)
         for i, layer in enumerate(self.layers):
-            h = layer.input_layernorm(x)
+            h = self.rms_norm(layer.input_layernorm, x)
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 qkv, b_in, a_in = self.project(h, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
@@ -284,7 +295,7 @@ class Engine:
                 k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
                 beta = b_in.sigmoid() * keep.to(h.dtype)
-                g = -lin.A_log.float().exp() * F.softplus(a_in.float() + lin.dt_bias) * keep
+                g = self.decays[i] * F.softplus(a_in.float() + lin.dt_bias) * keep
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
@@ -299,8 +310,8 @@ class Engine:
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
                 q_in, k_in, v_in = self.project(h, att.q_proj, att.k_proj, att.v_proj)
                 q, gate = q_in.view(B, T, H, 2 * D).chunk(2, dim=-1)
-                q = apply_rotary(att.q_norm(q), cos, sin)
-                self.k[i][rows, wpos] = apply_rotary(att.k_norm(k_in.view(B, T, Hkv, D)), cos, sin)
+                q = apply_rotary(self.rms_norm(att.q_norm, q), cos, sin)
+                self.k[i][rows, wpos] = apply_rotary(self.rms_norm(att.k_norm, k_in.view(B, T, Hkv, D)), cos, sin)
                 self.v[i][rows, wpos] = v_in.view(B, T, Hkv, D)
                 keys, vals = self.k[i][:B, :Lk], self.v[i][:B, :Lk]
                 with sdpa_kernel(EFFICIENT):
@@ -308,8 +319,8 @@ class Engine:
                                                        scale=att.scaling, enable_gqa=True).transpose(1, 2)
                 o = o.reshape(B, T, H * D) * torch.sigmoid(gate.reshape(B, T, H * D))
                 x = x + att.o_proj(o)
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
-        return base.model.norm(x)
+            x = x + layer.mlp(self.rms_norm(layer.post_attention_layernorm, x))
+        return self.rms_norm(base.model.norm, x)
 
     def cycle(self, B: int, Lw: int) -> None:
         base, view = self.base, self.view
@@ -327,7 +338,7 @@ class Engine:
         x = torch.cat((base.model.embed_tokens(cand), self.mask_embed.view(1, 1, -1).expand(B, M, -1)), dim=1)
         pending = {}
         for i, layer in enumerate(self.layers):
-            h = layer.input_layernorm(x)
+            h = self.rms_norm(layer.input_layernorm, x)
             key = str(i)
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
@@ -342,7 +353,7 @@ class Engine:
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, K, Hv, Dv).contiguous()
                 beta = b_in.sigmoid()
-                g = -lin.A_log.float().exp() * F.softplus(a_in.float() + lin.dt_bias)
+                g = self.decays[i] * F.softplus(a_in.float() + lin.dt_bias)
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
@@ -364,9 +375,9 @@ class Engine:
                 qm_in, km_in, vm_in = self.project(hm, view.attn_q[key], view.attn_k[key], view.attn_v[key])
                 qc, gc = qc_in.view(B, K, H, 2 * D).chunk(2, dim=-1)
                 qm, gm = qm_in.view(B, M, H, 2 * D).chunk(2, dim=-1)
-                q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
-                kc = att.k_norm(kc_in.view(B, K, Hkv, D))
-                km = att.k_norm(km_in.view(B, M, Hkv, D))
+                q = apply_rotary(self.rms_norm(att.q_norm, torch.cat((qc, qm), 1)), cos, sin)
+                kc = self.rms_norm(att.k_norm, kc_in.view(B, K, Hkv, D))
+                km = self.rms_norm(att.k_norm, km_in.view(B, M, Hkv, D))
                 k = apply_rotary(torch.cat((kc, km), 1), cos, sin)
                 self.k[i][rows, pos_c] = k[:, :K]
                 self.v[i][rows, pos_c] = vc_in.view(B, K, Hkv, D)
@@ -375,8 +386,8 @@ class Engine:
                 o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, used_end, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
-        am = (self.vocab_logits(base.model.norm(x)) + self.bias).argmax(-1)
+            x = x + layer.mlp(self.rms_norm(layer.post_attention_layernorm, x))
+        am = (self.vocab_logits(self.rms_norm(base.model.norm, x)) + self.bias).argmax(-1)
         pred = am[:, :K]
         match = (cand[:, 1:] == pred[:, :-1]).long()
         j = torch.cumprod(match, 1).sum(1) + 1
