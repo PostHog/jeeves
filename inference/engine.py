@@ -230,7 +230,10 @@ class Engine:
 
     def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hc, hm = h[:, :self.K], h[:, self.K:]
-        # With more than one row hc is strided, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
+        # With more than one row both halves are strided. CUDA multiplies a strided input with a batched GEMM that reads the weights once per
+        # row, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
+        if self.cuda:
+            return hc.contiguous(), hm.contiguous()
         return (hc.contiguous() if self.mps else hc), hm
 
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
