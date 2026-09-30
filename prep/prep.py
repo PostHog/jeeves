@@ -104,9 +104,22 @@ def contrast_cases(record: dict, seed: Any) -> list[dict]:
         r = variant_copy(record, variant)
         rq = copy.deepcopy(q)
         rq["criteria"][NONE_KEY] = NONE_TEXT
+        removed = None
         if variant == "none_absent":
-            rq["criteria"].pop(rq["label"])
+            removed = rq["label"]
+            rq["criteria"].pop(removed)
             rq["label"] = NONE_KEY
+        if rq.get("target") is not None:
+            # A target is keyed by option name, so the one this record inherited stops describing
+            # the variant the moment the option set changes: for none_absent the removed option's
+            # mass has nowhere to go and none_of_these - now the declared answer - carries none,
+            # which renormalises the target onto the distractors. Rebuild it over the new options
+            # and hand the removed option's mass to the key that replaced it. For none_present
+            # nothing was removed and none_of_these is a distractor, so it takes no mass.
+            old = rq["target"]
+            rq["target"] = {k: float(old.get(k, 0.0)) for k in rq["criteria"]}
+            if removed is not None:
+                rq["target"][NONE_KEY] += float(old.get(removed, 0.0))
         keys = list(rq["criteria"])
         random.Random(source_seed(seed, record["_meta"]["id"])).shuffle(keys)
         rq["criteria"] = {k: rq["criteria"][k] for k in keys}
