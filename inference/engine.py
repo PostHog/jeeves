@@ -12,8 +12,8 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, gated_delta_rule_advance, gated_delta_rule_chunk, gated_delta_rule_step,
-                         metal_enabled)
+from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, delta_gates, gated_delta_rule_advance, gated_delta_rule_chunk,
+                         gated_delta_rule_step, metal_enabled)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -342,8 +342,7 @@ class Engine:
                 q = q.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
-                beta = b_in.sigmoid() * keep.to(h.dtype)
-                g = self.log_decay_rates[i] * F.softplus(a_in.float() + lin.dt_bias) * keep
+                beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i], keep)
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
                     torch.gather(ext, 2, (lens[:, None] + self.ar_conv[None])[:, None, :].expand(B, lin.conv_dim, -1), out=self.conv[i][:B])
@@ -401,8 +400,7 @@ class Engine:
                 q = q.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, K, Hv, Dv).contiguous()
-                beta = b_in.sigmoid()
-                g = self.log_decay_rates[i] * F.softplus(a_in.float() + lin.dt_bias)
+                beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i])
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)

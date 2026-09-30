@@ -322,6 +322,13 @@ def gated_delta_rule_advance(k, v, g, beta, state, steps) -> None:
     state.copy_(gated_delta_rule_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), initial_state=state)[1])
 
 
+def delta_gates(b, a, dt_bias, log_decay_rate, keep=None) -> tuple[torch.Tensor, torch.Tensor]:
+    if _on_triton_inference(b, a):
+        return triton_kernels.delta_gates(b, a, dt_bias, log_decay_rate, keep)
+    beta, g = b.sigmoid(), log_decay_rate * F.softplus(a.float() + dt_bias)
+    return (beta, g) if keep is None else (beta * keep.to(beta.dtype), g * keep)
+
+
 class Cache:
     def __init__(self, num_layers: int):
         self.kv: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * num_layers

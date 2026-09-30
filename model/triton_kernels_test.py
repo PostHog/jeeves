@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, gated_delta_rule_advance, set_kernels
+from model.model import apply_rotary, delta_gates, gated_delta_rule_advance, set_kernels
 
 CUDA = torch.device("cuda")
 
@@ -66,8 +66,27 @@ def delta_advance() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def gates() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(6)
+    HV = 32
+    merged = (torch.randn(3, 5, 64 + 2 * HV, generator=gen) * 12).to(torch.bfloat16).to(CUDA)
+    b, a = merged[..., 64:64 + HV], merged[..., 64 + HV:]
+    rate = -torch.rand(HV, generator=gen).exp().to(CUDA)
+    keep = (torch.rand(3, 5, 1, generator=gen) < 0.7).float().to(CUDA)
+    for dt_bias in (torch.randn(HV, generator=gen).to(CUDA), torch.randn(HV, generator=gen).to(torch.bfloat16).to(CUDA)):
+        for kept in (None, keep):
+            eager, out = eager_then_triton(lambda: delta_gates(b, a, dt_bias, rate, kept))
+            for name, x, y in zip(("beta", "g"), out, eager):
+                if x.dtype != y.dtype or not torch.equal(x, y):
+                    failures.append(f"delta_gates {name} (dt_bias {dt_bias.dtype}, keep {kept is not None}) with the Triton kernel is not "
+                                    f"bitwise equal to eager")
+    return failures
+
+
 def main() -> None:
-    failures = rotary() + delta_advance()
+    failures = rotary() + delta_advance() + gates()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 
