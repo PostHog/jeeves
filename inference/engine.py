@@ -28,6 +28,19 @@ def store_transposed(linear: nn.Linear) -> None:
     linear.weight = nn.Parameter(linear.weight.t().contiguous().t(), requires_grad=False)
 
 
+def concatenated_linears(linears: tuple[nn.Module, ...]) -> nn.Module | None:
+    if not all(type(linear) is nn.Linear and linear.bias is None for linear in linears):
+        from inference.fp8 import FP8Linear
+        return FP8Linear.concatenated(list(linears)) if all(type(linear) is FP8Linear for linear in linears) else None
+    sizes = [linear.out_features for linear in linears]
+    weight = torch.cat([linear.weight.detach() for linear in linears])
+    merged = nn.Linear(linears[0].in_features, sum(sizes), bias=False, device="meta")
+    merged.weight = nn.Parameter(weight, requires_grad=False)
+    for linear, part in zip(linears, weight.split(sizes)):
+        linear.weight = nn.Parameter(part, requires_grad=False)
+    return merged
+
+
 def common_prefix(seqs: list[list[int]]) -> int:
     n = min(len(s) for s in seqs) - 1
     for i in range(n):
@@ -76,6 +89,16 @@ class Engine:
                     store_transposed(proj)
             for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
                 store_transposed(proj)
+        # On CUDA, projections that read the same input run as one GEMM; the originals become views of the merged weights.
+        self.merged: dict[int, nn.Module] = {}
+        if dev.type == "cuda":
+            groups = [(layer.linear_attn.in_proj_qkv, layer.linear_attn.in_proj_b, layer.linear_attn.in_proj_a) if layer.layer_type == LINEAR
+                      else (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj) for layer in base.model.layers]
+            groups += [(view.delta_q[key], view.delta_k[key], view.delta_v[key]) for key in view.delta_q]
+            groups += [(view.attn_q[key], view.attn_k[key], view.attn_v[key]) for key in view.attn_q]
+            for group in groups:
+                if (merged := concatenated_linears(group)) is not None:
+                    self.merged[id(group[0])] = merged
         torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.cfg = cfg = base.cfg
@@ -165,6 +188,12 @@ class Engine:
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
                                                   enable_gqa=gqa).transpose(1, 2)
 
+    def project(self, x: torch.Tensor, *linears: nn.Module) -> tuple[torch.Tensor, ...]:
+        merged = self.merged.get(id(linears[0]))
+        if merged is None:
+            return tuple(linear(x) for linear in linears)
+        return merged(x).split([linear.out_features for linear in linears], dim=-1)
+
     def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hc, hm = h[:, :self.K], h[:, self.K:]
         # With more than one row hc is strided, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
@@ -246,15 +275,16 @@ class Engine:
             h = layer.input_layernorm(x)
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
-                ext = torch.cat((self.conv[i][:B], lin.in_proj_qkv(h).transpose(1, 2)), dim=-1)
+                qkv, b_in, a_in = self.project(h, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
+                ext = torch.cat((self.conv[i][:B], qkv.transpose(1, 2)), dim=-1)
                 conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -T:]).transpose(1, 2)
                 q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
                 rep = lin.num_v_heads // lin.num_k_heads
                 q = q.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
-                beta = lin.in_proj_b(h).sigmoid() * keep.to(h.dtype)
-                g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(h).float() + lin.dt_bias) * keep
+                beta = b_in.sigmoid() * keep.to(h.dtype)
+                g = -lin.A_log.float().exp() * F.softplus(a_in.float() + lin.dt_bias) * keep
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
@@ -267,10 +297,11 @@ class Engine:
             else:
                 att = layer.self_attn
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
-                q, gate = att.q_proj(h).view(B, T, H, 2 * D).chunk(2, dim=-1)
+                q_in, k_in, v_in = self.project(h, att.q_proj, att.k_proj, att.v_proj)
+                q, gate = q_in.view(B, T, H, 2 * D).chunk(2, dim=-1)
                 q = apply_rotary(att.q_norm(q), cos, sin)
-                self.k[i][rows, wpos] = apply_rotary(att.k_norm(att.k_proj(h).view(B, T, Hkv, D)), cos, sin)
-                self.v[i][rows, wpos] = att.v_proj(h).view(B, T, Hkv, D)
+                self.k[i][rows, wpos] = apply_rotary(att.k_norm(k_in.view(B, T, Hkv, D)), cos, sin)
+                self.v[i][rows, wpos] = v_in.view(B, T, Hkv, D)
                 keys, vals = self.k[i][:B, :Lk], self.v[i][:B, :Lk]
                 with sdpa_kernel(EFFICIENT):
                     o = F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask,
@@ -302,22 +333,22 @@ class Engine:
                 lin = layer.linear_attn
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
                 hc, hm = self.split_candidate_rows(h)
-                ext = torch.cat((self.conv[i][:B], lin.in_proj_qkv(hc).transpose(1, 2)), dim=-1)
+                qkv, b_in, a_in = self.project(hc, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
+                ext = torch.cat((self.conv[i][:B], qkv.transpose(1, 2)), dim=-1)
                 conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -K:]).transpose(1, 2)
                 q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
                 rep = lin.num_v_heads // lin.num_k_heads
                 q = q.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, K, Hv, Dv).contiguous()
-                beta = lin.in_proj_b(hc).sigmoid()
-                g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(hc).float() + lin.dt_bias)
+                beta = b_in.sigmoid()
+                g = -lin.A_log.float().exp() * F.softplus(a_in.float() + lin.dt_bias)
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
                 self.dv[i][rows, pos_c] = v
-                qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
-                km = apply_rotary(view.delta_k[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
-                vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
+                qm, km, vm = (t.view(B, M, Hv, Dv) for t in self.project(hm, view.delta_q[key], view.delta_k[key], view.delta_v[key]))
+                qm, km = apply_rotary(qm, cos_m, sin_m), apply_rotary(km, cos_m, sin_m)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
                 o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
@@ -329,16 +360,18 @@ class Engine:
                 att = layer.self_attn
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
                 hc, hm = self.split_candidate_rows(h)
-                qc, gc = att.q_proj(hc).view(B, K, H, 2 * D).chunk(2, dim=-1)
-                qm, gm = view.attn_q[key](hm).view(B, M, H, 2 * D).chunk(2, dim=-1)
+                qc_in, kc_in, vc_in = self.project(hc, att.q_proj, att.k_proj, att.v_proj)
+                qm_in, km_in, vm_in = self.project(hm, view.attn_q[key], view.attn_k[key], view.attn_v[key])
+                qc, gc = qc_in.view(B, K, H, 2 * D).chunk(2, dim=-1)
+                qm, gm = qm_in.view(B, M, H, 2 * D).chunk(2, dim=-1)
                 q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
-                kc = att.k_norm(att.k_proj(hc).view(B, K, Hkv, D))
-                km = att.k_norm(view.attn_k[key](hm).view(B, M, Hkv, D))
+                kc = att.k_norm(kc_in.view(B, K, Hkv, D))
+                km = att.k_norm(km_in.view(B, M, Hkv, D))
                 k = apply_rotary(torch.cat((kc, km), 1), cos, sin)
                 self.k[i][rows, pos_c] = k[:, :K]
-                self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
+                self.v[i][rows, pos_c] = vc_in.view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
-                self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
+                self.v[i][:B, Lw:Lw + M] = vm_in.view(B, M, Hkv, D)
                 o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, used_end, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)

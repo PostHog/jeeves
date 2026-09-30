@@ -59,6 +59,22 @@ class FP8Linear(nn.Module):
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.split = split_for(self.out_features, self.in_features)
 
+    @classmethod
+    def concatenated(cls, parts: list[FP8Linear]) -> FP8Linear:
+        if any(p.bias is not None for p in parts):
+            raise ValueError("FP8Linear.concatenated: parts with a bias are not supported")
+        merged = cls.__new__(cls)
+        nn.Module.__init__(merged)
+        merged.register_buffer("weight", torch.cat([p.weight.view(torch.uint8) for p in parts]).view(FP8))
+        merged.register_buffer("scale", torch.cat([p.scale for p in parts]))
+        merged.bias = None
+        merged.in_features, merged.out_features = parts[0].in_features, merged.weight.shape[0]
+        merged.split = split_for(merged.out_features, merged.in_features)
+        sizes = [p.out_features for p in parts]
+        for p, weight, scale in zip(parts, merged.weight.split(sizes), merged.scale.split(sizes)):
+            p.weight, p.scale = weight, scale
+        return merged
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x2 = x.reshape(-1, shape[-1]).to(torch.bfloat16)
