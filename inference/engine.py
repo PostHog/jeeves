@@ -511,22 +511,31 @@ class Engine:
 
     @torch.no_grad()
     def answer(self, record: DataFormat, opts: Options) -> list[Result]:
-        out: list[Result] = []
-        for s in range(0, len(record.questions), self.R):
-            out.extend(self.group(record, record.questions[s:s + self.R], opts))
-        return out
+        return self.answer_batch([(record, opts)])[0]
 
-    def group(self, record: DataFormat, questions: list[Question], opts: Options) -> list[Result]:
+    def answer_batch(self, jobs: list[tuple[DataFormat, Options]]) -> list[list[Result]]:
+        rows = [(job, record, question, opts) for job, (record, opts) in enumerate(jobs) for question in record.questions]
+        # Rows that think share groups, so that rows without thinking do not hold decode rows.
+        rows.sort(key=lambda row: row[3].think)
+        results: list[list[Result]] = [[] for _ in jobs]
+        for start in range(0, len(rows), self.R):
+            chunk = rows[start:start + self.R]
+            for (job, *_), result in zip(chunk, self.group([(record, question, opts) for _, record, question, opts in chunk])):
+                results[job].append(result)
+        return results
+
+    def group(self, rows: list[tuple[DataFormat, Question, Options]]) -> list[Result]:
         enc = self.encoder
-        prompts = [enc.encode(enc.prompt_text(record, q)) for q in questions]
-        rems = [enc.encode(enc.remainder_text(q)) for q in questions]
-        B = len(questions)
+        prompts = [enc.encode(enc.prompt_text(record, q)) for record, q, _ in rows]
+        rems = [enc.encode(enc.remainder_text(q)) for _, q, _ in rows]
+        B = len(rows)
         slack = self.K + self.J + 2
         for p, r in zip(prompts, rems):
             if len(p) + len(r) + len(self.empty_think) + slack > self.L:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
-        budget = opts.max_think if opts.think else 0
-        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
+        budgets = [opts.max_think if opts.think else 0 for *_, opts in rows]
+        thresholds = [opts.nothink_threshold for *_, opts in rows]
+        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for budget, p, r in zip(budgets, prompts, rems)]
         # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so one merged pass would move the last prompt token and the no-think tail of a long prompt from bf16 to fp8 activations.
         merge_passes = not (self.cuda and self.precision == "fp8")
         P = common_prefix(prompts) if B > 1 or not merge_passes else 0
@@ -543,11 +552,10 @@ class Engine:
             h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
             last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
             first = (self.vocab_logits(last) + self.bias).argmax(-1)
-            if opts.nothink_threshold is not None or not all(caps):
+            if any(t is not None for t in thresholds) or not all(caps):
                 hn = self.extend(tails, [len(p) for p in prompts], commit=False)
                 nothink = [self.readout(hn[b], tails[b]) for b in range(B)]
-                if opts.nothink_threshold is not None:
-                    caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
+                caps = [c if t is None or max(nothink[b]) < t else 0 for b, (c, t) in enumerate(zip(caps, thresholds))]
         chains, closed = [[] for _ in range(B)], [False] * B
         probs = list(nothink) if nothink is not None else [[] for _ in range(B)]
         if any(caps):
