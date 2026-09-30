@@ -16,21 +16,26 @@ def _round_to_bf16(x):
 
 # Rounds cos, sin, both products and their sum to bf16, like apply_rotary's eager path on bf16.
 @triton.jit
-def _rotary(x, cos, sin, out, heads, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    token = row // heads
+def _rotated(x, cos, sin, x_row, cos_row, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
     d = tl.arange(0, BLOCK)
     inside = d < D
     rotated = d < 2 * N_FREQS
     lower = d < N_FREQS
     freq = tl.where(lower, d, d - N_FREQS)
-    value = tl.load(x + row * D + d, mask=inside, other=0.0).to(tl.float32)
-    partner = tl.load(x + row * D + tl.where(lower, d + N_FREQS, d - N_FREQS), mask=rotated, other=0.0).to(tl.float32)
-    c = _round_to_bf16(tl.load(cos + token * N_FREQS + freq, mask=rotated, other=0.0))
-    s = _round_to_bf16(tl.load(sin + token * N_FREQS + freq, mask=rotated, other=0.0))
+    value = tl.load(x + x_row + d, mask=inside, other=0.0).to(tl.float32)
+    partner = tl.load(x + x_row + tl.where(lower, d + N_FREQS, d - N_FREQS), mask=rotated, other=0.0).to(tl.float32)
+    c = _round_to_bf16(tl.load(cos + cos_row + freq, mask=rotated, other=0.0).to(tl.float32))
+    s = _round_to_bf16(tl.load(sin + cos_row + freq, mask=rotated, other=0.0).to(tl.float32))
     turned = tl.where(lower, -partner, partner)
     y = _round_to_bf16(value * c) + _round_to_bf16(turned * s)
-    tl.store(out + row * D + d, tl.where(rotated, y, value).to(tl.bfloat16), mask=inside)
+    return tl.where(rotated, y, value).to(tl.bfloat16)
+
+
+@triton.jit
+def _rotary(x, cos, sin, out, heads, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, BLOCK)
+    tl.store(out + row * D + d, _rotated(x, cos, sin, row * D, (row // heads) * N_FREQS, D, N_FREQS, BLOCK), mask=d < D)
 
 
 def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -169,3 +174,47 @@ def decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tens
     _decode_attention_combine[(B * Hkv, R * G)](partial_o, partial_lse, o, splits, *o.stride()[:3], HKV=Hkv, G=G, D=D, BLOCK_Q=block_q,
                                                 SPLITS_P2=triton.next_power_of_2(splits), num_warps=4)
     return o
+
+
+# Program (b, t, h): a candidate row t < K writes rotary(k) and v into the caches at positions[b, t]; a mask row writes rotary(qm) to the
+# returned queries, and rotary(km) and vm into the caches at tail + t - K.
+@triton.jit
+def _rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, q_out, positions, tail, stride_mb, stride_mt,
+                       stride_cb, stride_cs, K: tl.constexpr, M: tl.constexpr, H: tl.constexpr, D: tl.constexpr, N_FREQS: tl.constexpr,
+                       BLOCK: tl.constexpr):
+    program = tl.program_id(0).to(tl.int64)
+    h = program % H
+    t = (program // H) % (K + M)
+    b = program // (H * (K + M))
+    d = tl.arange(0, BLOCK)
+    inside = d < D
+    if t < K:
+        row = ((b * K + t) * H + h) * D
+        cache = b * stride_cb + tl.load(positions + b * K + t) * stride_cs + h * D
+        tl.store(k_cache + cache + d, _rotated(k, cos_c, sin_c, row, (b * K + t) * N_FREQS, D, N_FREQS, BLOCK), mask=inside)
+        tl.store(v_cache + cache + d, tl.load(v + row + d, mask=inside, other=0.0), mask=inside)
+    else:
+        m = t - K
+        row = b * stride_mb + m * stride_mt + h * D
+        cos_row = (b * M + m) * N_FREQS
+        tl.store(q_out + ((b * M + m) * H + h) * D + d, _rotated(qm, cos_m, sin_m, row, cos_row, D, N_FREQS, BLOCK), mask=inside)
+        cache = b * stride_cb + (tail + m) * stride_cs + h * D
+        tl.store(k_cache + cache + d, _rotated(km, cos_m, sin_m, row, cos_row, D, N_FREQS, BLOCK), mask=inside)
+        tl.store(v_cache + cache + d, tl.load(vm + row + d, mask=inside, other=0.0), mask=inside)
+
+
+def rotate_into_cache(k: torch.Tensor, v: torch.Tensor, qm: torch.Tensor, km: torch.Tensor, vm: torch.Tensor, cos_c: torch.Tensor,
+                      sin_c: torch.Tensor, cos_m: torch.Tensor, sin_m: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                      positions: torch.Tensor, tail: int) -> torch.Tensor:
+    B, K, H, D = k.shape
+    M = qm.shape[1]
+    if not (qm.stride() == km.stride() == vm.stride() and qm.stride()[2:] == (D, 1)):
+        raise ValueError("qm, km and vm must share strides, with each head's D values contiguous")
+    if k_cache.stride() != v_cache.stride() or k_cache.stride()[2:] != (D, 1) or 2 * cos_c.shape[-1] > D:
+        raise ValueError("the caches must share strides with contiguous heads, and the rotary dims must fit the head dim")
+    q_out = torch.empty(B, M, H, D, dtype=qm.dtype, device=qm.device)
+    cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos_c, sin_c, cos_m, sin_m))
+    _rotate_into_cache[(B * (K + M) * H,)](k.contiguous(), v.contiguous(), qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, q_out,
+                                           positions.contiguous(), tail, qm.stride(0), qm.stride(1), k_cache.stride(0), k_cache.stride(1),
+                                           K=K, M=M, H=H, D=D, N_FREQS=cos_c.shape[-1], BLOCK=triton.next_power_of_2(D))
+    return q_out

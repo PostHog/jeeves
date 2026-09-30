@@ -13,7 +13,7 @@ from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
 from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace,
-                         gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled)
+                         gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled, rotate_into_cache)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -389,12 +389,8 @@ class Engine:
                 beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i])
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
-                self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
-                self.dv[i][rows, pos_c] = v
                 qm, km, vm = (t.view(B, M, Hv, Dv) for t in self.project(hm, view.delta_q[key], view.delta_k[key], view.delta_v[key]))
-                qm, km = apply_rotary(qm, cos_m, sin_m), apply_rotary(km, cos_m, sin_m)
-                self.dk[i][:B, Lw:Lw + M] = km
-                self.dv[i][:B, Lw:Lw + M] = vm
+                qm = rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, self.dk[i], self.dv[i], rows, pos_c, Lw)
                 o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)

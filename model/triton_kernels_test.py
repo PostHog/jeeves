@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace, set_kernels
+from model.model import apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace, rotate_into_cache, set_kernels
 
 CUDA = torch.device("cuda")
 BITS = {torch.float32: torch.int32, torch.bfloat16: torch.int16}
@@ -123,12 +123,39 @@ def attention() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def cache_writes() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(8)
+    H, D, n_freqs, slots, tail = 32, 128, 32, 700, 512
+    for B, K in ((1, 4), (4, 4), (2, 8)):
+        M = K * (K - 1)
+        k, v = (torch.randn(B, K, H, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2))
+        merged = torch.randn(B, M, 3 * H * D + 8, generator=gen).to(torch.bfloat16).to(CUDA)
+        qm, km, vm = (merged[..., i * H * D:(i + 1) * H * D].view(B, M, H, D) for i in range(3))
+        positions = (torch.randint(0, tail - K, (B, 1), generator=gen) + torch.arange(K)[None]).to(CUDA)
+        freqs = torch.rand(B, K + M, 1, generator=gen) * 4000 * torch.logspace(0, -7, n_freqs)
+        cos, sin = freqs.cos().to(CUDA), freqs.sin().to(CUDA)
+        rows = torch.arange(B, device=CUDA)[:, None].expand(B, K)
+        caches = [torch.randn(8, slots, H, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2)]
+
+        def written() -> tuple[torch.Tensor, ...]:
+            k_cache, v_cache = (c.clone() for c in caches)
+            q = rotate_into_cache(k, v, qm, km, vm, cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:], k_cache, v_cache, rows, positions, tail)
+            return q, k_cache, v_cache
+        eager, out = eager_then_triton(written)
+        for name, x, y in zip(("queries", "key cache", "value cache"), out, eager):
+            if not same_bits(x, y):
+                failures.append(f"rotate_into_cache {(B, K)}: the Triton kernel's {name} is not bitwise equal to eager")
+    return failures
+
+
 def main() -> None:
     enabled = set_kernels(triton_inference=True, gdn=True)
     if not (enabled["triton_inference"] and enabled["gdn"]):
         print(f"the Triton and fla kernels are not available, so nothing can be checked: {enabled}")
         sys.exit(1)
-    failures = rotary() + delta_advance() + gates() + attention()
+    failures = rotary() + delta_advance() + gates() + attention() + cache_writes()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 
