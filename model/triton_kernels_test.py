@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, set_kernels
+from model.model import apply_rotary, gated_delta_rule_advance, set_kernels
 
 CUDA = torch.device("cuda")
 
@@ -42,8 +42,32 @@ def rotary() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def delta_advance() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(5)
+    for B, T, H, HV, D in ((4, 4, 32, 32, 128), (2, 4, 16, 32, 128), (3, 1, 32, 32, 128)):
+        k = torch.randn(B, T, H, D, generator=gen).to(torch.bfloat16).to(CUDA)
+        v = torch.randn(B, T, HV, D, generator=gen).to(torch.bfloat16).to(CUDA)
+        g = -torch.rand(B, T, HV, generator=gen).to(CUDA)
+        beta = torch.rand(B, T, HV, generator=gen).to(torch.bfloat16).to(CUDA)
+        state = torch.randn(B, HV, D, D, generator=gen).to(CUDA)
+        steps = torch.arange(B).remainder(T + 1).to(CUDA)
+
+        def advanced() -> torch.Tensor:
+            advanced_state = state.clone()
+            gated_delta_rule_advance(k, v, g, beta, advanced_state, steps)
+            return advanced_state
+        eager, out = eager_then_triton(advanced)
+        if not torch.equal(out, eager):
+            failures.append(f"gated_delta_rule_advance {(B, T, H, HV, D)} with the Triton kernel is not bitwise equal to fla's masked steps")
+        if not torch.equal(out[steps == 0], state[steps == 0]):
+            failures.append(f"gated_delta_rule_advance {(B, T, H, HV, D)} changed a row that advances 0 steps")
+    return failures
+
+
 def main() -> None:
-    failures = rotary()
+    failures = rotary() + delta_advance()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 

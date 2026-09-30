@@ -314,6 +314,14 @@ def gated_delta_rule_step(q, k, v, g, beta, initial_state=None, output_final_sta
                                             output_final_state=output_final_state)
 
 
+def gated_delta_rule_advance(k, v, g, beta, state, steps) -> None:
+    if _on("gdn", k) and _on_triton_inference(k, v, g, beta):
+        triton_kernels.gated_delta_rule_advance(k, v, g, beta, state, steps)
+        return
+    keep = (torch.arange(k.shape[1], device=k.device)[None] < steps[:, None]).float()[..., None]
+    state.copy_(gated_delta_rule_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), initial_state=state)[1])
+
+
 class Cache:
     def __init__(self, num_layers: int):
         self.kv: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * num_layers

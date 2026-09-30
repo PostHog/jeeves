@@ -12,7 +12,8 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import FrozenRMSNorm, RMSNorm, apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
+from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, gated_delta_rule_advance, gated_delta_rule_chunk, gated_delta_rule_step,
+                         metal_enabled)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -165,6 +166,7 @@ class Engine:
         self.ar_k = torch.arange(K, device=dev)
         self.ar_j = torch.arange(J, device=dev)
         self.ar_l = torch.arange(max_len + 1, device=dev)
+        self.ar_conv = torch.arange(cfg.linear_conv_kernel_dim, device=dev)
         block_of_mask = torch.arange(K, device=dev).repeat_interleave(J)
         self.mask_offset = block_of_mask + (self.ar_j + 1).repeat(K)
         self.limit_offset = torch.cat((self.ar_k, block_of_mask))
@@ -202,11 +204,11 @@ class Engine:
             return metal.gated_delta_rule_outputs(q, k, v, g, beta, state)
         return delta_step(q, k, v, g, beta, state, False)[0]
 
-    def delta_commit(self, k, v, g, beta, state, accepted, keep) -> None:
+    def delta_commit(self, k, v, g, beta, state, accepted) -> None:
         if self.metal:
             metal.gated_delta_rule_advance_inplace(k, v, g, beta, state, accepted)
         else:
-            state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
+            gated_delta_rule_advance(k, v, g, beta, state, accepted)
 
     def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor | None, tail_start: int) -> torch.Tensor:
         B, length = q.shape[0], mask.shape[-1]
@@ -344,8 +346,7 @@ class Engine:
                 g = self.log_decay_rates[i] * F.softplus(a_in.float() + lin.dt_bias) * keep
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
-                    idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
-                    self.conv[i][:B].copy_(ext.gather(2, idx))
+                    torch.gather(ext, 2, (lens[:, None] + self.ar_conv[None])[:, None, :].expand(B, lin.conv_dim, -1), out=self.conv[i][:B])
                 self.dk[i][rows, wpos] = apply_rotary(k, cos, sin)
                 self.dv[i][rows, wpos] = v
                 z = lin.in_proj_z(h).view(B, T, lin.num_v_heads, lin.head_v_dim)
@@ -446,11 +447,10 @@ class Engine:
         jm1 = (j - 1).clamp(min=0)
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
-        keep = None if self.metal else (self.ar_k[None] < j[:, None]).float()[..., None]
+        conv_columns = (j[:, None] + self.ar_conv[None])[:, None, :]
         for i, (k, v, g, beta, ext) in pending.items():
-            self.delta_commit(k, v, g, beta, self.rec[i][:B], j, keep)
-            idx = (j[:, None] + torch.arange(ext.shape[-1] - K, device=self.device)[None])[:, None, :].expand(B, ext.shape[1], -1)
-            self.conv[i][:B].copy_(ext.gather(2, idx))
+            self.delta_commit(k, v, g, beta, self.rec[i][:B], j)
+            torch.gather(ext, 2, conv_columns.expand(B, ext.shape[1], -1), out=self.conv[i][:B])
         cand.copy_(torch.where(done[:, None], cand, nxt))
         done.logical_or_((first_eos < j) | (self.n_out[:B] + j >= self.cap[:B]))
         n.add_(j)
