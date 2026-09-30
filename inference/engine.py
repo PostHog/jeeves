@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from export import load_export
-from inference.fp8 import quantize, warm
-from inference.types import Options, Result
+from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
-from model.model import apply_rotary, gated_delta_rule_chunk
+from model import metal
+from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -18,7 +20,11 @@ EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
-    return fused_recurrent_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=state, output_final_state=final, use_qk_l2norm_in_kernel=True)
+    return gated_delta_rule_step(q, k, v, g, beta, initial_state=state, output_final_state=final)
+
+
+def store_transposed(linear: nn.Linear) -> None:
+    linear.weight = nn.Parameter(linear.weight.t().contiguous().t(), requires_grad=False)
 
 
 def common_prefix(seqs: list[list[int]]) -> int:
@@ -31,10 +37,19 @@ def common_prefix(seqs: list[list[int]]) -> int:
 
 
 class Engine:
-    def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
-                 window_step: int = 512, sync_every: int = 4, device: str = "cuda"):
-        self.device = dev = torch.device(device)
-        base, head, encoder = load_export(model, device=device)
+    def __init__(self, model: str, drafter: str, block: int = 4, precision: str = "bf16", max_rows: int = 8, max_len: int = 8192,
+                 window_step: int = 512, sync_every: int | None = None, device: str | None = None):
+        self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
+        self.mps = dev.type == "mps"
+        if precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self.precision = precision
+        fp8 = precision == "fp8"
+        fp8_supported = self.metal if self.mps else (dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9))
+        if fp8 and not fp8_supported:
+            raise ValueError("precision='fp8' needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels enabled "
+                             "(unset QWEN35_KERNELS=0)")
+        base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
         missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
@@ -42,16 +57,26 @@ class Engine:
             raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
         view.requires_grad_(False)
         self.dtype = base.lm_head.weight.dtype
-        fp8 = fp8 and torch.cuda.get_device_capability(dev) >= (8, 9)
-        if fp8:
+        if fp8 and self.mps:
+            from inference.fp8_metal import quantize
+            quantize(view)
+        elif fp8:
+            from inference.fp8 import quantize, warm
             quantize(view)
             warm(view)
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
-        torch.cuda.empty_cache()
+        if self.mps and not fp8 and torch.backends.mps.is_macos_or_newer(15, 0):
+            # On torch 2.14, MPS computes x @ W.T faster, and bitwise equal, with W.T contiguous once x has 10 or more rows, but slower with fewer; so only projections fed the K + M cycle rows switch, except attn_k/attn_v, which are slower even at M rows.
+            for layer in base.model.layers:
+                mixer = (layer.linear_attn.in_proj_z, layer.linear_attn.out_proj) if layer.layer_type == LINEAR else (layer.self_attn.o_proj,)
+                for proj in (*mixer, layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+                    store_transposed(proj)
+            for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
+                store_transposed(proj)
+        torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
-        self.fp8 = fp8
         self.cfg = cfg = base.cfg
         self.K = K = block
         self.J = J = K - 1
@@ -59,7 +84,8 @@ class Engine:
         self.R, self.L = max_rows, max_len
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
-        self.window_step, self.sync_every = window_step, sync_every
+        # Without CUDA graphs a host sync is cheap, and each unneeded cycle after the last row finishes costs a full forward.
+        self.window_step, self.sync_every = window_step, sync_every or (4 if dev.type == "cuda" else 1)
         self.eos = encoder.think_end_id
         self.pad = encoder.pad_id
         self.opt_end = encoder.opt_end_id
@@ -95,9 +121,59 @@ class Engine:
         row_block = torch.cat((torch.full((K,), -1, device=dev), block_of_mask))
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
 
-    def bucket(self, n: int) -> int:
+    @property
+    def metal(self) -> bool:
+        return self.mps and metal_enabled()
+
+    def delta_extend(self, q, k, v, g, beta, state, commit: bool) -> torch.Tensor:
+        if self.metal:
+            return metal.gated_delta_rule_outputs(q, k, v, g, beta, state, advance_state=commit)
+        o, final = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=state, output_final_state=True)
+        if commit:
+            state.copy_(final)
+        return o
+
+    def delta_outputs(self, q, k, v, g, beta, state) -> torch.Tensor:
+        if self.metal:
+            return metal.gated_delta_rule_outputs(q, k, v, g, beta, state)
+        return delta_step(q, k, v, g, beta, state, False)[0]
+
+    def delta_commit(self, k, v, g, beta, state, accepted, keep) -> None:
+        if self.metal:
+            metal.gated_delta_rule_advance_inplace(k, v, g, beta, state, accepted)
+        else:
+            state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
+
+    def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor | None, tail_start: int) -> torch.Tensor:
+        B, length = q.shape[0], mask.shape[-1]
+        gqa = q.shape[2] != k_cache.shape[2]
+        if self.metal:
+            # Tuned on an M4 Pro with torch 2.14: the chunked kernel wins from 2 rows for the delta layers' mask queries, and from 4 rows for attention.
+            if B >= (4 if gqa else 2):
+                return metal.chunked_cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
+            return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
+        keys, vals = k_cache[:B, :length], v_cache[:B, :length]
+        with sdpa_kernel(EFFICIENT):
+            return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
+                                                  enable_gqa=gqa).transpose(1, 2)
+
+    def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hc, hm = h[:, :self.K], h[:, self.K:]
+        # With more than one row hc is strided, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
+        return (hc.contiguous() if self.mps else hc), hm
+
+    def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if not self.mps or not isinstance(self.base.lm_head, nn.Linear):
+            return self.base.lm_head(h)
+        # MPS in torch 2.14 picks a slow kernel for the 248k-row matmul; row chunks of the weight give bitwise-equal logits much faster.
+        return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
+
+    def decode_rows(self, n: int) -> int:
+        if self.device.type != "cuda":
+            return n
+        # CUDA captures a graph per row count, so rounding up to a power of two keeps the number of graphs small.
         b = 1
         while b < n:
             b *= 2
@@ -135,9 +211,8 @@ class Engine:
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
                 beta = lin.in_proj_b(h).sigmoid() * keep.to(h.dtype)
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(h).float() + lin.dt_bias) * keep
-                o, state = gated_delta_rule_chunk(q, k, v, g, beta, initial_state=self.rec[i][:B], output_final_state=True)
+                o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
-                    self.rec[i][:B].copy_(state)
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
                     self.conv[i][:B].copy_(ext.gather(2, idx))
                 self.dk[i][rows, wpos] = apply_rotary(k, cos, sin)
@@ -168,6 +243,8 @@ class Engine:
         pos_c = n[:, None] + self.ar_k[None]
         pos = torch.cat((pos_c, n[:, None] + self.mask_offset[None]), dim=1)
         cos, sin = base.model.rotary_emb(pos)
+        cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:]))
+        used_end = n + K if self.metal else None
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
@@ -180,29 +257,26 @@ class Engine:
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
-                hc, hm = h[:, :K], h[:, K:]
+                hc, hm = self.split_candidate_rows(h)
                 ext = torch.cat((self.conv[i][:B], lin.in_proj_qkv(hc).transpose(1, 2)), dim=-1)
                 conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -K:]).transpose(1, 2)
                 q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
                 rep = lin.num_v_heads // lin.num_k_heads
                 q = q.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                v = v.reshape(B, K, Hv, Dv)
+                v = v.reshape(B, K, Hv, Dv).contiguous()
                 beta = lin.in_proj_b(hc).sigmoid()
                 g = -lin.A_log.float().exp() * F.softplus(lin.in_proj_a(hc).float() + lin.dt_bias)
-                o_c, _ = delta_step(q, k, v, g, beta, self.rec[i][:B], False)
+                o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
-                self.dk[i][rows, pos_c] = apply_rotary(k, cos[:, :K], sin[:, :K])
+                self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
                 self.dv[i][rows, pos_c] = v
-                qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos[:, K:], sin[:, K:])
-                km = apply_rotary(view.delta_k[key](hm).view(B, M, Hv, Dv), cos[:, K:], sin[:, K:])
+                qm = apply_rotary(view.delta_q[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
+                km = apply_rotary(view.delta_k[key](hm).view(B, M, Hv, Dv), cos_m, sin_m)
                 vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
-                keys, vals = self.dk[i][:B, :Lw + M], self.dv[i][:B, :Lw + M]
-                with sdpa_kernel(EFFICIENT):
-                    o_m = F.scaled_dot_product_attention(qm.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2),
-                                                         attn_mask=mask[:, :, K:], scale=Dv ** -0.5).transpose(1, 2)
+                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
                 o = lin.norm(o.reshape(-1, Dv), z.reshape(-1, Dv)).view(B, K + M, lin.value_dim)
@@ -210,7 +284,7 @@ class Engine:
             else:
                 att = layer.self_attn
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
-                hc, hm = h[:, :K], h[:, K:]
+                hc, hm = self.split_candidate_rows(h)
                 qc, gc = att.q_proj(hc).view(B, K, H, 2 * D).chunk(2, dim=-1)
                 qm, gm = view.attn_q[key](hm).view(B, M, H, 2 * D).chunk(2, dim=-1)
                 q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
@@ -221,14 +295,11 @@ class Engine:
                 self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
                 self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
-                keys, vals = self.k[i][:B, :Lw + M], self.v[i][:B, :Lw + M]
-                with sdpa_kernel(EFFICIENT):
-                    o = F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask,
-                                                       scale=att.scaling, enable_gqa=True).transpose(1, 2)
+                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, used_end, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))
-        am = (base.lm_head(base.model.norm(x)) + self.bias).argmax(-1)
+        am = (self.vocab_logits(base.model.norm(x)) + self.bias).argmax(-1)
         pred = am[:, :K]
         match = (cand[:, 1:] == pred[:, :-1]).long()
         j = torch.cumprod(match, 1).sum(1) + 1
@@ -239,10 +310,9 @@ class Engine:
         jm1 = (j - 1).clamp(min=0)
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
-        keep = (self.ar_k[None] < j[:, None]).float()[..., None]
+        keep = None if self.metal else (self.ar_k[None] < j[:, None]).float()[..., None]
         for i, (k, v, g, beta, ext) in pending.items():
-            _, state = delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), self.rec[i][:B], True)
-            self.rec[i][:B].copy_(state)
+            self.delta_commit(k, v, g, beta, self.rec[i][:B], j, keep)
             idx = (j[:, None] + torch.arange(ext.shape[-1] - K, device=self.device)[None])[:, None, :].expand(B, ext.shape[1], -1)
             self.conv[i][:B].copy_(ext.gather(2, idx))
         cand.copy_(torch.where(done[:, None], cand, nxt))
@@ -269,9 +339,14 @@ class Engine:
         self.graphs[(B, Lw)] = g
         return g
 
+    def cycle_runner(self, B: int, Lw: int) -> Callable[[], None]:
+        if self.device.type == "cuda":
+            return self.graph(B, Lw).replay
+        return lambda: self.cycle(B, Lw)
+
     @torch.no_grad()
     def decode(self, B: int, prompts: list[list[int]], first: torch.Tensor, caps: list[int]) -> tuple[list[list[int]], list[bool]]:
-        Bp = self.bucket(B)
+        Bp = self.decode_rows(B)
         dev = self.device
         self.n[:Bp].zero_()
         self.n[:B].copy_(torch.tensor([len(p) for p in prompts], device=dev))
@@ -285,9 +360,9 @@ class Engine:
         top = max(len(p) for p in prompts)
         while True:
             need = top + (self.sync_every + 1) * self.K + 1
-            g = self.graph(Bp, min(self.L, -(-need // self.window_step) * self.window_step))
+            run_cycle = self.cycle_runner(Bp, min(self.L, -(-need // self.window_step) * self.window_step))
             for _ in range(self.sync_every):
-                g.replay()
+                run_cycle()
             finished, top = torch.stack((self.done[:Bp].all().long(), self.n[:B].max())).tolist()
             if finished:
                 break
@@ -332,23 +407,27 @@ class Engine:
         for p, r in zip(prompts, rems):
             if len(p) + len(r) + len(self.empty_think) + slack > self.L:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
-        P = common_prefix(prompts)
-        self.reset(self.bucket(B))
+        budget = opts.max_think if opts.think else 0
+        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
+        P = common_prefix(prompts) if B > 1 or not self.mps else 0
+        self.reset(self.decode_rows(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
-        h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
-        last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
-        first = (self.base.lm_head(last) + self.bias).argmax(-1)
-        budget = opts.max_think if opts.think else 0
-        caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
-        nothink = None
-        if opts.nothink_threshold is not None or not all(caps):
-            seqs = [self.empty_think + r for r in rems]
-            hn = self.extend(seqs, [len(p) for p in prompts], commit=False)
-            nothink = [self.readout(hn[b], seqs[b]) for b in range(B)]
-            if opts.nothink_threshold is not None:
-                caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
+        tails = [self.empty_think + r for r in rems]
+        first = nothink = None
+        if self.mps and not any(caps):
+            hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
+            nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
+        else:
+            h = self.extend([p[P:] for p in prompts], [P] * B, commit=True)
+            last = h[torch.arange(B, device=self.device), torch.tensor([len(p) - P - 1 for p in prompts], device=self.device)]
+            first = (self.vocab_logits(last) + self.bias).argmax(-1)
+            if opts.nothink_threshold is not None or not all(caps):
+                hn = self.extend(tails, [len(p) for p in prompts], commit=False)
+                nothink = [self.readout(hn[b], tails[b]) for b in range(B)]
+                if opts.nothink_threshold is not None:
+                    caps = [c if max(nothink[b]) < opts.nothink_threshold else 0 for b, c in enumerate(caps)]
         chains, closed = [[] for _ in range(B)], [False] * B
         probs = list(nothink) if nothink is not None else [[] for _ in range(B)]
         if any(caps):

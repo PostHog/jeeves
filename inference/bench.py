@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from inference.types import Options
+from inference.types import PRECISIONS, Options
 from prep.format import read_jsonl
 
 if TYPE_CHECKING:
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--model", default="runs/fused")
     ap.add_argument("--drafter", default="runs/drafter_k4/drafter.safetensors")
     ap.add_argument("--block", type=int, default=4)
-    ap.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     ap.add_argument("--data", default="data/dev.jsonl")
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
@@ -38,16 +38,16 @@ def main(argv: list[str] | None = None) -> None:
     records = read_jsonl(a.data)
     if a.limit and a.limit < len(records):
         records = random.Random(a.seed).sample(records, a.limit)
-    engine = Engine(a.model, a.drafter, block=a.block, fp8=a.fp8, max_rows=a.max_rows,
+    engine = Engine(a.model, a.drafter, block=a.block, precision=a.precision, max_rows=a.max_rows,
                     max_len=a.max_len, window_step=a.window_step)
     opts = Options(think=a.think, max_think=a.max_think, nothink_threshold=a.nothink_threshold)
     engine.answer(records[0], Options(max_think=16))
     rows, lat = [], []
     for rec in records:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         t0 = time.time()
         results = engine.answer(rec, opts)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         lat.append(time.time() - t0)
         for q, r in zip(rec.questions, results):
             p = r.probs
@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
     n = len(rows)
     lat_sorted = sorted(lat)
     thought = [r for r in rows if r["thought"]]
-    summary = {"fp8": engine.fp8, "block": a.block, "records": len(records), "questions": n, "acc": sum(r["ok"] for r in rows) / n,
+    summary = {"precision": engine.precision, "block": a.block, "records": len(records), "questions": n, "acc": sum(r["ok"] for r in rows) / n,
                "nll": -sum(torch.tensor(max(r["p_label"], 1e-9)).log().item() for r in rows) / n,
                "thought_frac": len(thought) / n, "closed_frac_of_thought": sum(r["closed"] for r in thought) / max(1, len(thought)),
                "mean_chain_tokens": sum(r["tokens"] for r in rows) / n,

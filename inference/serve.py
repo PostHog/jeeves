@@ -11,7 +11,7 @@ import torch
 
 from inference.api import MODEL_ID, parse_request, response
 from inference.engine import Engine
-from inference.types import Options
+from inference.types import PRECISIONS, Options
 from prep.format import DataFormat, Question
 
 RELEASE_DATE = "2026-09-29"
@@ -25,10 +25,10 @@ class Server:
     def systemone(self, body) -> dict:
         record, model, opts = parse_request(body, self.defaults)
         with self.lock:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             t0 = time.time()
             results = self.engine.answer(record, opts)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             ms = (time.time() - t0) * 1000
         return response(record, model, opts, results, self.engine.encoder.tok, ms)
 
@@ -76,7 +76,7 @@ def main() -> None:
     ap.add_argument("--model", default="runs/fused")
     ap.add_argument("--drafter", default="runs/drafter_k4/drafter.safetensors")
     ap.add_argument("--block", type=int, default=4)
-    ap.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     ap.add_argument("--max-rows", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=8192)
     ap.add_argument("--max-think", type=int, default=2560)
@@ -84,11 +84,11 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8009)
     a = ap.parse_args()
-    engine = Engine(a.model, a.drafter, block=a.block, fp8=a.fp8, max_rows=a.max_rows, max_len=a.max_len)
+    engine = Engine(a.model, a.drafter, block=a.block, precision=a.precision, max_rows=a.max_rows, max_len=a.max_len)
     defaults = Options(max_think=a.max_think, nothink_threshold=a.nothink_threshold)
     warm = DataFormat(state="warmup", questions=[Question(id="q", type="noul", instructions="Is this a warmup?")])
     engine.answer(warm, Options(max_think=16))
-    info = {"model": a.model, "drafter": a.drafter, "block": a.block, "fp8": engine.fp8}
+    info = {"model": a.model, "drafter": a.drafter, "block": a.block, "precision": engine.precision}
     httpd = ThreadingHTTPServer((a.host, a.port), handler(Server(engine, defaults, info)))
     print(json.dumps({"serving": f"http://{a.host}:{a.port}", **info}), flush=True)
     httpd.serve_forever()

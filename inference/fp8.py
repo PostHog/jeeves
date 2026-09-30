@@ -5,8 +5,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-FP8 = torch.float8_e4m3fn
-FP8_MAX = torch.finfo(FP8).max
+from inference.fp8_weights import FP8, FP8_MAX, quantize_rows, replace_linears
 
 CONFIGS = [triton.Config({"BLOCK_N": n, "BLOCK_M": m, "BLOCK_K": k}, num_warps=w, num_stages=st)
            for n in (32, 64, 128) for m in (16, 32, 64, 128) for k in (128, 256) for w, st in ((4, 4), (8, 3))
@@ -53,10 +52,9 @@ def split_for(N: int, K: int) -> int:
 class FP8Linear(nn.Module):
     def __init__(self, linear: nn.Linear):
         super().__init__()
-        w = linear.weight.detach().float()
-        scale = w.abs().amax(1).clamp(min=1e-12) / FP8_MAX
-        self.register_buffer("weight", (w / scale[:, None]).to(FP8).contiguous())
-        self.register_buffer("scale", scale.contiguous())
+        weight, scale = quantize_rows(linear.weight)
+        self.register_buffer("weight", weight)
+        self.register_buffer("scale", scale)
         self.bias = None if linear.bias is None else nn.Parameter(linear.bias.detach().to(torch.bfloat16), requires_grad=False)
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.split = split_for(self.out_features, self.in_features)
@@ -86,14 +84,7 @@ class FP8Linear(nn.Module):
 
 
 def quantize(module: nn.Module) -> int:
-    n = 0
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear) and child.in_features % 256 == 0 and child.out_features >= 1024 and child.out_features % 16 == 0:
-            setattr(module, name, FP8Linear(child))
-            n += 1
-        else:
-            n += quantize(child)
-    return n
+    return replace_linears(module, FP8Linear)
 
 
 @torch.no_grad()
