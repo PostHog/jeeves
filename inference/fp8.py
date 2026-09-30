@@ -5,9 +5,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from inference.fp8_weights import FP8, FP8_MAX, quantize_rows, replace_linears
+from inference.fp8_weights import quantize_rows, replace_linears
 
-LARGE_M = 256
 # Above this many rows, one conversion kernel for the activations costs less than converting them again in every program.
 CONVERT_IN_GEMM_M = 16
 TARGET_BLOCKS = 264
@@ -94,12 +93,13 @@ def split_for(N: int, K: int) -> int:
 def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, split: int) -> torch.Tensor:
     M, K = x.shape
     N = weight.shape[0]
-    block_m = min(64, max(16, triton.next_power_of_2(M)))
+    # Prefill-sized passes have enough row tiles to fill the GPU without split-K, and larger tiles reuse each weight tile more.
+    block_m, split, stages = (128, 1, 3) if M > 256 else (min(64, max(16, triton.next_power_of_2(M))), split, 4)
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, block_m), split)
     counters = TILE_COUNTERS.get(x.device)
     if counters is None:
         counters = TILE_COUNTERS[x.device] = torch.zeros(1 << 16, dtype=torch.int32, device=x.device)
-    if grid[0] * grid[1] > counters.numel():
+    if split > 1 and grid[0] * grid[1] > counters.numel():
         raise ValueError(f"{grid[0] * grid[1]} tiles exceed the {counters.numel()} tile counters")
     y = torch.empty(M, N, device=x.device, dtype=torch.bfloat16)
     partial = torch.empty(split, M, N, device=x.device, dtype=torch.float32) if split > 1 else y
@@ -112,7 +112,7 @@ def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, split
         _fp16_rows[(M,)](x, source, row_scale, K, x.stride(0), BLOCK=1024)
     _fp8_matmul[grid](source, row_scale, weight, scale, y, partial, counters, M, N, K, source.stride(0), weight.stride(0), y.stride(0),
                       K // split, SPLIT=split, BLOCK_N=BLOCK_N, BLOCK_M=block_m, BLOCK_K=BLOCK_K, CONVERT=convert, num_warps=4,
-                      num_stages=4)
+                      num_stages=stages)
     return y
 
 
@@ -142,17 +142,10 @@ class FP8Linear(nn.Module):
         x2 = x.reshape(-1, shape[-1]).to(torch.bfloat16)
         if x2.stride(-1) != 1:
             x2 = x2.contiguous()
-        M = x2.shape[0]
-        N = self.out_features
-        if M > LARGE_M:
-            sx = x2.float().abs().amax(-1, keepdim=True).clamp(min=1e-12) / FP8_MAX
-            y = torch._scaled_mm((x2.float() / sx).to(FP8), self.weight.t(), scale_a=sx, scale_b=self.scale[None],
-                                 out_dtype=torch.bfloat16)
-        else:
-            y = fp8_matmul(x2, self.weight, self.scale, self.split)
+        y = fp8_matmul(x2, self.weight, self.scale, self.split)
         if self.bias is not None:
             y = y + self.bias
-        return y.view(*shape[:-1], N)
+        return y.view(*shape[:-1], self.out_features)
 
 
 def quantize(module: nn.Module) -> int:
@@ -166,6 +159,6 @@ def warm(module: nn.Module) -> int:
         if isinstance(m, FP8Linear) and (m.out_features, m.in_features) not in seen:
             seen.add((m.out_features, m.in_features))
             w = m.weight
-            for rows in (4, 12, 16, 32, 64, 128, 256):
+            for rows in (4, 12, 16, 32, 64, 128, 256, 512):
                 m(torch.zeros(rows, m.in_features, device=w.device, dtype=torch.bfloat16))
     return len(seen)

@@ -71,7 +71,7 @@ def fp8_matmuls() -> list[str]:
     for N, K in ((4096, 4096), (1024, 12288)):
         linear = FP8Linear.quantized(nn.Linear(K, N, bias=False, device=CUDA, dtype=torch.bfloat16))
         dequantized = linear.weight.float() * linear.scale[:, None]
-        for M in (1, 4, 12, 16, 17, 48, 256):
+        for M in (1, 4, 12, 16, 17, 48, 256, 300, 1024):
             x = torch.randn(M, K, device=CUDA, dtype=torch.bfloat16)
             x[:, 0] = 1e5
             reference = x.float() @ dequantized.t()

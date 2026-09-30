@@ -174,9 +174,6 @@ class Engine:
         self.extend_graphs: dict[tuple[int, int, int, bool], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if self.cuda else None
         if self.cuda:
-            from inference.fp8 import LARGE_M
-            # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so a padded pass must not cross that limit where the real one would not.
-            self.fp8_activation_rows = LARGE_M if fp8 else None
             self.capture_stream = torch.cuda.Stream()
             longest = min(EXTEND_GRAPH_LENGTHS[-1], max_len)
             self.extend_ids = torch.full((max_rows, longest), self.pad, dtype=torch.long, device=dev)
@@ -263,9 +260,6 @@ class Engine:
         padded_T = next((n for n in EXTEND_GRAPH_LENGTHS if T <= n <= self.L), None) if self.cuda else None
         # Short passes round their row count up like decode cycles, so fewer graphs are captured; on long passes the extra rows would cost real GPU time.
         rows = self.decode_rows(B) if padded_T is not None and padded_T <= 256 else B
-        limit = self.fp8_activation_rows if self.cuda else None
-        if padded_T is not None and limit is not None and (B * T > limit) != (rows * padded_T > limit):
-            padded_T = None
         width = T if padded_T is None else padded_T
         ids = torch.full((B, width), self.pad, dtype=torch.long)
         valid = torch.zeros(B, width, dtype=torch.bool)
@@ -536,16 +530,14 @@ class Engine:
         budgets = [opts.max_think if opts.think else 0 for *_, opts in rows]
         thresholds = [opts.nothink_threshold for *_, opts in rows]
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for budget, p, r in zip(budgets, prompts, rems)]
-        # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so one merged pass would move the last prompt token and the no-think tail of a long prompt from bf16 to fp8 activations.
-        merge_passes = not (self.cuda and self.precision == "fp8")
-        P = common_prefix(prompts) if B > 1 or not merge_passes else 0
+        P = common_prefix(prompts) if B > 1 else 0
         self.reset(self.decode_rows(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
         tails = [self.empty_think + r for r in rems]
         first = nothink = None
-        if merge_passes and not any(caps):
+        if not any(caps):
             hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
             nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
         else:
