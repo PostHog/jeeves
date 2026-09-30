@@ -135,8 +135,8 @@ class Engine:
         self.R, self.L = max_rows, max_len
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
-        # Without CUDA graphs a host sync is cheap, and each unneeded cycle after the last row finishes costs a full forward.
-        self.window_step, self.sync_every = window_step, sync_every or (4 if self.cuda else 1)
+        # Each unneeded cycle after the last row finishes costs a full forward, which is more than a host sync costs, also with CUDA graphs.
+        self.window_step, self.sync_every = window_step, sync_every or 1
         self.eos = encoder.think_end_id
         self.pad = encoder.pad_id
         self.opt_end = encoder.opt_end_id
