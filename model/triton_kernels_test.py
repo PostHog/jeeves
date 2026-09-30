@@ -4,10 +4,18 @@ import sys
 
 import torch
 
-from model import triton_kernels
 from model.model import apply_rotary, set_kernels
 
 CUDA = torch.device("cuda")
+
+
+def eager_then_triton(fn):
+    set_kernels(triton_inference=False)
+    try:
+        eager = fn()
+    finally:
+        set_kernels(triton_inference=True)
+    return eager, fn()
 
 
 @torch.no_grad()
@@ -19,12 +27,18 @@ def rotary() -> list[str]:
         positions = (torch.arange(T)[None] + torch.randint(0, 8000, (B, 1), generator=gen)).float()[..., None]
         freqs = positions * torch.logspace(0, -7, 32)
         cos, sin = freqs.cos().to(CUDA), freqs.sin().to(CUDA)
-        set_kernels(triton_inference=False)
-        eager = apply_rotary(x, cos, sin)
-        set_kernels(triton_inference=True)
-        out = triton_kernels.rotary(x, cos, sin)
+        eager, out = eager_then_triton(lambda: apply_rotary(x, cos, sin))
         if not torch.equal(out, eager):
-            failures.append(f"rotary {(B, T, H, D)} in Triton is not bitwise equal to eager")
+            failures.append(f"apply_rotary {(B, T, H, D)} with the Triton kernel is not bitwise equal to eager")
+        shared_eager, shared_out = eager_then_triton(lambda: apply_rotary(x, cos[0], sin[0]))
+        if not torch.equal(shared_out, shared_eager):
+            failures.append(f"apply_rotary {(B, T, H, D)} with 2-D cos changed with the Triton kernel on")
+    x = torch.randn(1, 2, 4, 128, generator=gen).to(torch.bfloat16).to(CUDA)
+    x[0, 0, 0, 5] = float("nan")
+    freqs = torch.arange(2).float()[None, :, None] * torch.logspace(0, -7, 32)
+    eager, out = eager_then_triton(lambda: apply_rotary(x, freqs.cos().to(CUDA), freqs.sin().to(CUDA)))
+    if not torch.equal(out.isnan(), eager.isnan()):
+        failures.append("apply_rotary with the Triton kernel does not propagate NaN like eager")
     return failures
 
 

@@ -105,6 +105,10 @@ def _on_metal(*xs: torch.Tensor) -> bool:
     return metal_enabled() and all(x.is_mps and x.dtype == torch.bfloat16 for x in xs) and not _needs_grad(*xs)
 
 
+def _on_triton_inference(x: torch.Tensor, *others: torch.Tensor) -> bool:
+    return _on("triton_inference", x) and x.dtype == torch.bfloat16 and not torch.compiler.is_compiling() and not _needs_grad(x, *others)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -122,6 +126,18 @@ class RMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+class FrozenRMSNorm(RMSNorm):
+    def __init__(self, norm: RMSNorm):
+        super().__init__(norm.weight.shape[0], norm.eps)
+        self.weight = norm.weight
+        self.register_buffer("shifted_weight", 1.0 + norm.weight.detach().float(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _on("rms_norm", x):
+            return _fla_rms_norm(x, self.shifted_weight, None, eps=self.eps)
+        return super().forward(x)
 
 
 class GatedRMSNorm(nn.Module):
@@ -165,7 +181,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     if x.dim() == 4 and _on_metal(x) and not _needs_grad(cos, sin):
         return metal.rotary(x, cos, sin)
-    if x.dim() == 4 and _on("triton_inference", x) and x.dtype == torch.bfloat16 and not _needs_grad(x, cos, sin):
+    # Only for per-row positions (3-D cos), where the kernel replaces the eager path; with 2-D cos fla's rotary runs, which rounds differently.
+    if x.dim() == 4 and cos.dim() == 3 and _on_triton_inference(x, cos, sin):
         return triton_kernels.rotary(x, cos, sin)
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     if cos.dim() == 2 and _on("rotary", x):

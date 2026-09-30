@@ -12,12 +12,13 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import KERNELS, RMSNorm, apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
+from model.model import FrozenRMSNorm, RMSNorm, apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
-EXTEND_LENGTHS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+# Longer passes run eagerly at their exact length: there the GPU work outweighs the launch cost a graph removes, and padding would add to it.
+EXTEND_GRAPH_LENGTHS = (32, 64, 128, 256, 512, 1024, 1536, 2048)
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
@@ -28,17 +29,27 @@ def store_transposed(linear: nn.Linear) -> None:
     linear.weight = nn.Parameter(linear.weight.t().contiguous().t(), requires_grad=False)
 
 
-def concatenated_linears(linears: tuple[nn.Module, ...]) -> nn.Module | None:
-    if not all(type(linear) is nn.Linear and linear.bias is None for linear in linears):
-        from inference.fp8 import FP8Linear
-        return FP8Linear.concatenated(list(linears)) if all(type(linear) is FP8Linear for linear in linears) else None
-    sizes = [linear.out_features for linear in linears]
-    weight = torch.cat([linear.weight.detach() for linear in linears])
-    merged = nn.Linear(linears[0].in_features, sum(sizes), bias=False, device="meta")
-    merged.weight = nn.Parameter(weight, requires_grad=False)
-    for linear, part in zip(linears, weight.split(sizes)):
-        linear.weight = nn.Parameter(part, requires_grad=False)
-    return merged
+def merge_linears_in_place(linears: tuple[nn.Module, ...]) -> nn.Module | None:
+    if any(linear.bias is not None for linear in linears):
+        return None
+    if all(type(linear) is nn.Linear for linear in linears):
+        sizes = [linear.out_features for linear in linears]
+        weight = torch.cat([linear.weight.detach() for linear in linears])
+        merged = nn.Linear(linears[0].in_features, sum(sizes), bias=False, device="meta")
+        merged.weight = nn.Parameter(weight, requires_grad=False)
+        for linear, part in zip(linears, weight.split(sizes)):
+            linear.weight = nn.Parameter(part, requires_grad=False)
+        return merged
+    from inference.fp8 import FP8Linear
+    return FP8Linear.concatenated(list(linears)) if all(type(linear) is FP8Linear for linear in linears) else None
+
+
+def freeze_rms_norms(module: nn.Module) -> None:
+    for name, child in module.named_children():
+        if type(child) is RMSNorm:
+            setattr(module, name, FrozenRMSNorm(child))
+        else:
+            freeze_rms_norms(child)
 
 
 def common_prefix(seqs: list[list[int]]) -> int:
@@ -54,12 +65,12 @@ class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, precision: str = "bf16", max_rows: int = 8, max_len: int = 8192,
                  window_step: int = 512, sync_every: int | None = None, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
-        self.mps = dev.type == "mps"
+        self.mps, self.cuda = dev.type == "mps", dev.type == "cuda"
         if precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
         self.precision = precision
         fp8 = precision == "fp8"
-        fp8_supported = self.metal if self.mps else (dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9))
+        fp8_supported = self.metal if self.mps else (self.cuda and torch.cuda.get_device_capability(dev) >= (8, 9))
         if fp8 and not fp8_supported:
             raise ValueError("precision='fp8' needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels enabled "
                              "(unset QWEN35_KERNELS=0)")
@@ -75,9 +86,8 @@ class Engine:
             from inference.fp8_metal import quantize
             quantize(view)
         elif fp8:
-            from inference.fp8 import quantize, warm
+            from inference.fp8 import quantize
             quantize(view)
-            warm(view)
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
@@ -89,23 +99,25 @@ class Engine:
                     store_transposed(proj)
             for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
                 store_transposed(proj)
-        # On CUDA, projections that read the same input run as one GEMM; the originals become views of the merged weights.
-        self.merged: dict[int, nn.Module] = {}
-        if dev.type == "cuda":
+        # On CUDA, projections that read the same input run as one GEMM, which saves launches and reads the input once. In fp8, in_proj_b
+        # and in_proj_a stay bf16, so a delta layer's group falls back to merging just that pair.
+        self.merged_projections: dict[tuple[int, ...], nn.Module] = {}
+        if self.cuda:
             groups = [(layer.linear_attn.in_proj_qkv, layer.linear_attn.in_proj_b, layer.linear_attn.in_proj_a) if layer.layer_type == LINEAR
                       else (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj) for layer in base.model.layers]
             groups += [(view.delta_q[key], view.delta_k[key], view.delta_v[key]) for key in view.delta_q]
             groups += [(view.attn_q[key], view.attn_k[key], view.attn_v[key]) for key in view.attn_q]
             for group in groups:
-                if (merged := concatenated_linears(group)) is not None:
-                    self.merged[id(group[0])] = merged
-        # Each RMSNorm call on CUDA would rebuild its float32 1 + weight, and each delta layer its decay, so both are built once here.
-        self.shifted_norm_weights: dict[int, torch.Tensor] = {}
-        if dev.type == "cuda" and KERNELS["rms_norm"]:
-            from fla.modules.layernorm import rms_norm as fla_rms_norm
-            self.fla_rms_norm = fla_rms_norm
-            self.shifted_norm_weights = {id(m): 1.0 + m.weight.float() for m in base.modules() if isinstance(m, RMSNorm)}
-        self.decays = {i: -layer.linear_attn.A_log.float().exp() for i, layer in enumerate(base.model.layers) if layer.layer_type == LINEAR}
+                for candidate in (group, group[1:]):
+                    if (merged := merge_linears_in_place(candidate)) is not None:
+                        self.merged_projections[tuple(map(id, candidate))] = merged
+                        break
+            freeze_rms_norms(base)
+            if fp8:
+                from inference.fp8 import warm
+                warm(view)
+                warm(nn.ModuleList(self.merged_projections.values()))
+        self.log_decay_rates = {i: -layer.linear_attn.A_log.float().exp() for i, layer in enumerate(base.model.layers) if layer.layer_type == LINEAR}
         torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.cfg = cfg = base.cfg
@@ -116,7 +128,7 @@ class Engine:
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
         # Without CUDA graphs a host sync is cheap, and each unneeded cycle after the last row finishes costs a full forward.
-        self.window_step, self.sync_every = window_step, sync_every or (4 if dev.type == "cuda" else 1)
+        self.window_step, self.sync_every = window_step, sync_every or (4 if self.cuda else 1)
         self.eos = encoder.think_end_id
         self.pad = encoder.pad_id
         self.opt_end = encoder.opt_end_id
@@ -151,13 +163,20 @@ class Engine:
         self.limit_offset = torch.cat((self.ar_k, block_of_mask))
         row_block = torch.cat((torch.full((K,), -1, device=dev), block_of_mask))
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
-        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
-        self.extend_graphs: dict[tuple[int, int, int, bool], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
-        self.extend_ids = torch.full((max_rows, max_len), self.pad, dtype=torch.long, device=dev)
-        self.extend_valid = torch.zeros(max_rows, max_len, dtype=torch.bool, device=dev)
-        self.extend_lens = torch.zeros(max_rows, dtype=torch.long, device=dev)
-        self.extend_starts = torch.zeros(max_rows, dtype=torch.long, device=dev)
+        self.cycle_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.extend_graphs: dict[tuple[int, int, int, bool], torch.cuda.CUDAGraph] = {}
+        self.pool = torch.cuda.graph_pool_handle() if self.cuda else None
+        if self.cuda:
+            from inference.fp8 import LARGE_M
+            # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so a padded pass must not cross that limit where the real one would not.
+            self.fp8_activation_rows = LARGE_M if fp8 else None
+            self.capture_stream = torch.cuda.Stream()
+            longest = min(EXTEND_GRAPH_LENGTHS[-1], max_len)
+            self.extend_ids = torch.full((max_rows, longest), self.pad, dtype=torch.long, device=dev)
+            self.extend_valid = torch.zeros(max_rows, longest, dtype=torch.bool, device=dev)
+            self.extend_lens = torch.zeros(max_rows, dtype=torch.long, device=dev)
+            self.extend_starts = torch.zeros(max_rows, dtype=torch.long, device=dev)
+            self.extend_out = torch.empty(max_rows, longest, cfg.hidden_size, dtype=self.dtype, device=dev)
 
     @property
     def metal(self) -> bool:
@@ -195,15 +214,19 @@ class Engine:
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
                                                   enable_gqa=gqa).transpose(1, 2)
 
-    def rms_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        shifted = self.shifted_norm_weights.get(id(norm))
-        return norm(x) if shifted is None else self.fla_rms_norm(x, shifted, None, eps=norm.eps)
-
     def project(self, x: torch.Tensor, *linears: nn.Module) -> tuple[torch.Tensor, ...]:
-        merged = self.merged.get(id(linears[0]))
-        if merged is None:
+        if not self.merged_projections:
             return tuple(linear(x) for linear in linears)
-        return merged(x).split([linear.out_features for linear in linears], dim=-1)
+        outputs, start = [], 0
+        while start < len(linears):
+            end = next((end for end in range(len(linears), start + 1, -1) if tuple(map(id, linears[start:end])) in self.merged_projections), start + 1)
+            if end == start + 1:
+                outputs.append(linears[start](x))
+            else:
+                merged = self.merged_projections[tuple(map(id, linears[start:end]))]
+                outputs += merged(x).split([linear.out_features for linear in linears[start:end]], dim=-1)
+            start = end
+        return tuple(outputs)
 
     def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hc, hm = h[:, :self.K], h[:, self.K:]
@@ -217,7 +240,7 @@ class Engine:
         return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
 
     def decode_rows(self, n: int) -> int:
-        if self.device.type != "cuda":
+        if not self.cuda:
             return n
         # CUDA captures a graph per row count, so rounding up to a power of two keeps the number of graphs small.
         b = 1
@@ -229,50 +252,61 @@ class Engine:
     def extend(self, seqs: list[list[int]], starts: list[int], commit: bool) -> torch.Tensor:
         B, T = len(seqs), max(len(s) for s in seqs)
         Lk = max(st + len(s) for st, s in zip(starts, seqs))
-        graphed = self.device.type == "cuda"
-        # A pass is thousands of small launches, so CUDA replays a graph captured for its length rounded up; trailing padding changes no valid row.
-        padded = min(next((n for n in EXTEND_LENGTHS if n >= T), T), self.L) if graphed else T
-        ids = torch.full((B, padded), self.pad, dtype=torch.long)
-        valid = torch.zeros(B, padded, dtype=torch.bool)
+        padded_T = next((n for n in EXTEND_GRAPH_LENGTHS if T <= n <= self.L), None) if self.cuda else None
+        # Short passes round their row count up like decode cycles, so fewer graphs are captured; on long passes the extra rows would cost real GPU time.
+        rows = self.decode_rows(B) if padded_T is not None and padded_T <= 256 else B
+        limit = self.fp8_activation_rows if self.cuda else None
+        if padded_T is not None and limit is not None and (B * T > limit) != (rows * padded_T > limit):
+            padded_T = None
+        width = T if padded_T is None else padded_T
+        ids = torch.full((B, width), self.pad, dtype=torch.long)
+        valid = torch.zeros(B, width, dtype=torch.bool)
         for b, s in enumerate(seqs):
             ids[b, :len(s)] = torch.tensor(s, dtype=torch.long)
             valid[b, :len(s)] = True
-        lens, first = torch.tensor([len(s) for s in seqs]), torch.tensor(starts)
-        if not graphed:
+        lens, start_positions = torch.tensor([len(s) for s in seqs]), torch.tensor(starts)
+        if padded_T is None:
             dev = self.device
-            return self.extend_layers(ids.to(dev), valid.to(dev), lens.to(dev), first.to(dev), Lk, commit)
-        keys = padded if max(starts) == 0 else min(-(-Lk // self.window_step) * self.window_step, self.L)
-        self.extend_ids[:B, :padded].copy_(ids)
-        self.extend_valid[:B, :padded].copy_(valid)
+            return self.extend_pass(ids.to(dev), valid.to(dev), lens.to(dev), start_positions.to(dev), Lk, commit)
+        padded_Lk = padded_T if max(starts) == 0 else min(max(self.window_step, 1 << (Lk - 1).bit_length()), self.L)
+        self.extend_ids[:rows, :padded_T].fill_(self.pad)
+        self.extend_valid[:rows, :padded_T].zero_()
+        self.extend_lens[:rows].zero_()
+        self.extend_starts[:rows].zero_()
+        self.extend_ids[:B, :padded_T].copy_(ids)
+        self.extend_valid[:B, :padded_T].copy_(valid)
         self.extend_lens[:B].copy_(lens)
-        self.extend_starts[:B].copy_(first)
-        graph, out = self.extend_graph(B, padded, keys, commit)
-        graph.replay()
-        return out[:, :T]
+        self.extend_starts[:B].copy_(start_positions)
+        self.extend_graph(rows, padded_T, padded_Lk, commit).replay()
+        # A view of the shared output buffer: the next extend overwrites it.
+        return self.extend_out[:B, :T]
 
-    def extend_graph(self, B: int, T: int, Lk: int, commit: bool) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
-        cached = self.extend_graphs.get((B, T, Lk, commit))
-        if cached is not None:
-            return cached
+    def extend_graph(self, B: int, T: int, Lk: int, commit: bool) -> torch.cuda.CUDAGraph:
+        graph = self.extend_graphs.get((B, T, Lk, commit))
+        if graph is not None:
+            return graph
         inputs = (self.extend_ids[:B, :T], self.extend_valid[:B, :T], self.extend_lens[:B], self.extend_starts[:B], Lk, commit)
-        # The warm-up passes advance the recurrent state, which the caller's own replay must start from.
-        states = [t[:B] for d in (self.conv, self.rec) for t in d.values()]
+        # A committing warm-up advances conv and rec, so they are restored before the caller's replay.
+        states = [t[:B] for d in (self.conv, self.rec) for t in d.values()] if commit else []
         saved = [t.clone() for t in states]
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(2):
-                self.extend_layers(*inputs)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.pool):
-            out = self.extend_layers(*inputs)
+        graph = self.captured(lambda: self.extend_out[:B, :T].copy_(self.extend_pass(*inputs)), warmups=1)
         for t, s in zip(states, saved):
             t.copy_(s)
-        self.extend_graphs[(B, T, Lk, commit)] = graph, out
-        return graph, out
+        self.extend_graphs[(B, T, Lk, commit)] = graph
+        return graph
 
-    def extend_layers(self, ids: torch.Tensor, valid: torch.Tensor, lens: torch.Tensor, starts: torch.Tensor, Lk: int, commit: bool) -> torch.Tensor:
+    def captured(self, run: Callable[[], object], warmups: int) -> torch.cuda.CUDAGraph:
+        self.capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.capture_stream):
+            for _ in range(warmups):
+                run()
+        torch.cuda.current_stream().wait_stream(self.capture_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool, stream=self.capture_stream):
+            run()
+        return graph
+
+    def extend_pass(self, ids: torch.Tensor, valid: torch.Tensor, lens: torch.Tensor, starts: torch.Tensor, Lk: int, commit: bool) -> torch.Tensor:
         dev, base = self.device, self.base
         B, T = ids.shape
         pos = starts[:, None] + torch.arange(T, device=dev)[None]
@@ -283,7 +317,7 @@ class Engine:
         keep = valid.float()[..., None]
         x = base.model.embed_tokens(ids)
         for i, layer in enumerate(self.layers):
-            h = self.rms_norm(layer.input_layernorm, x)
+            h = layer.input_layernorm(x)
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 qkv, b_in, a_in = self.project(h, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
@@ -295,7 +329,7 @@ class Engine:
                 k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
                 beta = b_in.sigmoid() * keep.to(h.dtype)
-                g = self.decays[i] * F.softplus(a_in.float() + lin.dt_bias) * keep
+                g = self.log_decay_rates[i] * F.softplus(a_in.float() + lin.dt_bias) * keep
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
                     idx = (lens[:, None] + torch.arange(lin.conv_kernel, device=dev)[None])[:, None, :].expand(B, lin.conv_dim, -1)
@@ -310,8 +344,8 @@ class Engine:
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
                 q_in, k_in, v_in = self.project(h, att.q_proj, att.k_proj, att.v_proj)
                 q, gate = q_in.view(B, T, H, 2 * D).chunk(2, dim=-1)
-                q = apply_rotary(self.rms_norm(att.q_norm, q), cos, sin)
-                self.k[i][rows, wpos] = apply_rotary(self.rms_norm(att.k_norm, k_in.view(B, T, Hkv, D)), cos, sin)
+                q = apply_rotary(att.q_norm(q), cos, sin)
+                self.k[i][rows, wpos] = apply_rotary(att.k_norm(k_in.view(B, T, Hkv, D)), cos, sin)
                 self.v[i][rows, wpos] = v_in.view(B, T, Hkv, D)
                 keys, vals = self.k[i][:B, :Lk], self.v[i][:B, :Lk]
                 with sdpa_kernel(EFFICIENT):
@@ -319,8 +353,8 @@ class Engine:
                                                        scale=att.scaling, enable_gqa=True).transpose(1, 2)
                 o = o.reshape(B, T, H * D) * torch.sigmoid(gate.reshape(B, T, H * D))
                 x = x + att.o_proj(o)
-            x = x + layer.mlp(self.rms_norm(layer.post_attention_layernorm, x))
-        return self.rms_norm(base.model.norm, x)
+            x = x + layer.mlp(layer.post_attention_layernorm(x))
+        return base.model.norm(x)
 
     def cycle(self, B: int, Lw: int) -> None:
         base, view = self.base, self.view
@@ -338,7 +372,7 @@ class Engine:
         x = torch.cat((base.model.embed_tokens(cand), self.mask_embed.view(1, 1, -1).expand(B, M, -1)), dim=1)
         pending = {}
         for i, layer in enumerate(self.layers):
-            h = self.rms_norm(layer.input_layernorm, x)
+            h = layer.input_layernorm(x)
             key = str(i)
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
@@ -353,7 +387,7 @@ class Engine:
                 k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, K, Hv, Dv).contiguous()
                 beta = b_in.sigmoid()
-                g = self.decays[i] * F.softplus(a_in.float() + lin.dt_bias)
+                g = self.log_decay_rates[i] * F.softplus(a_in.float() + lin.dt_bias)
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)
                 self.dk[i][rows, pos_c] = apply_rotary(k, cos_c, sin_c)
@@ -375,9 +409,9 @@ class Engine:
                 qm_in, km_in, vm_in = self.project(hm, view.attn_q[key], view.attn_k[key], view.attn_v[key])
                 qc, gc = qc_in.view(B, K, H, 2 * D).chunk(2, dim=-1)
                 qm, gm = qm_in.view(B, M, H, 2 * D).chunk(2, dim=-1)
-                q = apply_rotary(self.rms_norm(att.q_norm, torch.cat((qc, qm), 1)), cos, sin)
-                kc = self.rms_norm(att.k_norm, kc_in.view(B, K, Hkv, D))
-                km = self.rms_norm(att.k_norm, km_in.view(B, M, Hkv, D))
+                q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
+                kc = att.k_norm(kc_in.view(B, K, Hkv, D))
+                km = att.k_norm(km_in.view(B, M, Hkv, D))
                 k = apply_rotary(torch.cat((kc, km), 1), cos, sin)
                 self.k[i][rows, pos_c] = k[:, :K]
                 self.v[i][rows, pos_c] = vc_in.view(B, K, Hkv, D)
@@ -386,8 +420,8 @@ class Engine:
                 o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, used_end, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
-            x = x + layer.mlp(self.rms_norm(layer.post_attention_layernorm, x))
-        am = (self.vocab_logits(self.rms_norm(base.model.norm, x)) + self.bias).argmax(-1)
+            x = x + layer.mlp(layer.post_attention_layernorm(x))
+        am = (self.vocab_logits(base.model.norm(x)) + self.bias).argmax(-1)
         pred = am[:, :K]
         match = (cand[:, 1:] == pred[:, :-1]).long()
         j = torch.cumprod(match, 1).sum(1) + 1
@@ -408,28 +442,20 @@ class Engine:
         n.add_(j)
         self.n_out[:B].add_(j)
 
-    def graph(self, B: int, Lw: int) -> torch.cuda.CUDAGraph:
-        g = self.graphs.get((B, Lw))
-        if g is not None:
-            return g
+    def cycle_graph(self, B: int, Lw: int) -> torch.cuda.CUDAGraph:
+        graph = self.cycle_graphs.get((B, Lw))
+        if graph is not None:
+            return graph
         saved = self.done[:B].clone()
         self.done[:B].fill_(True)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(2):
-                self.cycle(B, Lw)
-        torch.cuda.current_stream().wait_stream(stream)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, pool=self.pool):
-            self.cycle(B, Lw)
+        graph = self.captured(lambda: self.cycle(B, Lw), warmups=2)
         self.done[:B].copy_(saved)
-        self.graphs[(B, Lw)] = g
-        return g
+        self.cycle_graphs[(B, Lw)] = graph
+        return graph
 
     def cycle_runner(self, B: int, Lw: int) -> Callable[[], None]:
-        if self.device.type == "cuda":
-            return self.graph(B, Lw).replay
+        if self.cuda:
+            return self.cycle_graph(B, Lw).replay
         return lambda: self.cycle(B, Lw)
 
     @torch.no_grad()
@@ -497,14 +523,17 @@ class Engine:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
         budget = opts.max_think if opts.think else 0
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
-        P = common_prefix(prompts) if B > 1 else 0
+        # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so one merged pass would move the last prompt token and the no-think tail
+        # of a long prompt from bf16 to fp8 activations.
+        merge_passes = not (self.cuda and self.precision == "fp8")
+        P = common_prefix(prompts) if B > 1 or not merge_passes else 0
         self.reset(self.decode_rows(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
         tails = [self.empty_think + r for r in rems]
         first = nothink = None
-        if not any(caps):
+        if merge_passes and not any(caps):
             hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
             nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
         else:

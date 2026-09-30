@@ -81,7 +81,7 @@ On an M4 Pro, one question thinks at about 20 tokens per second, and a request w
 
 `--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay bf16 at every size, while CUDA also quantizes them above 256 rows. The weights then use 11.5 GB, and one question thinks at about 31 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
 
-`python -m model.metal_test` checks the Metal kernels against float64 and eager references. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
+`python -m model.metal_test` checks the Metal kernels against float64 and eager references, and on CUDA `python -m model.triton_kernels_test` and `python -m inference.cuda_test` check the Triton rotary and the merged projections. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
 
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 

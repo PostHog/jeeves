@@ -50,26 +50,21 @@ def split_for(N: int, K: int) -> int:
 
 
 class FP8Linear(nn.Module):
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, weight: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None):
         super().__init__()
-        weight, scale = quantize_rows(linear.weight)
         self.register_buffer("weight", weight)
         self.register_buffer("scale", scale)
-        self.bias = None if linear.bias is None else nn.Parameter(linear.bias.detach().to(torch.bfloat16), requires_grad=False)
-        self.in_features, self.out_features = linear.in_features, linear.out_features
+        self.bias = None if bias is None else nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
+        self.out_features, self.in_features = weight.shape
         self.split = split_for(self.out_features, self.in_features)
 
     @classmethod
+    def quantized(cls, linear: nn.Linear) -> FP8Linear:
+        return cls(*quantize_rows(linear.weight), linear.bias)
+
+    @classmethod
     def concatenated(cls, parts: list[FP8Linear]) -> FP8Linear:
-        if any(p.bias is not None for p in parts):
-            raise ValueError("FP8Linear.concatenated: parts with a bias are not supported")
-        merged = cls.__new__(cls)
-        nn.Module.__init__(merged)
-        merged.register_buffer("weight", torch.cat([p.weight.view(torch.uint8) for p in parts]).view(FP8))
-        merged.register_buffer("scale", torch.cat([p.scale for p in parts]))
-        merged.bias = None
-        merged.in_features, merged.out_features = parts[0].in_features, merged.weight.shape[0]
-        merged.split = split_for(merged.out_features, merged.in_features)
+        merged = cls(torch.cat([p.weight for p in parts]), torch.cat([p.scale for p in parts]), None)
         sizes = [p.out_features for p in parts]
         for p, weight, scale in zip(parts, merged.weight.split(sizes), merged.scale.split(sizes)):
             p.weight, p.scale = weight, scale
@@ -100,7 +95,7 @@ class FP8Linear(nn.Module):
 
 
 def quantize(module: nn.Module) -> int:
-    return replace_linears(module, FP8Linear)
+    return replace_linears(module, FP8Linear.quantized)
 
 
 @torch.no_grad()

@@ -9,7 +9,8 @@ import triton.language as tl
 @triton.jit
 def _round_to_bf16(x):
     bits = x.to(tl.uint32, bitcast=True)
-    return ((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000).to(tl.float32, bitcast=True)
+    rounded = ((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000).to(tl.float32, bitcast=True)
+    return tl.where(x != x, x, rounded)
 
 
 # Rounds cos, sin, both products and their sum to bf16, like apply_rotary's eager path on bf16.
@@ -34,6 +35,8 @@ def _rotary(x, cos, sin, out, heads, D: tl.constexpr, N_FREQS: tl.constexpr, BLO
 def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     B, T, H, D = x.shape
     n_freqs = cos.shape[-1]
+    if x.dtype != torch.bfloat16:
+        raise ValueError(f"x: expected bfloat16, got {x.dtype}")
     if 2 * n_freqs > D:
         raise ValueError(f"x: head dim {D} is smaller than the {2 * n_freqs} rotary dims")
     x = x.contiguous()
