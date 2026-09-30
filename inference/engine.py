@@ -17,6 +17,7 @@ from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
+PRECISIONS = ("bf16", "fp8")
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
@@ -37,10 +38,16 @@ def common_prefix(seqs: list[list[int]]) -> int:
 
 
 class Engine:
-    def __init__(self, model: str, drafter: str, block: int = 4, fp8: bool = True, max_rows: int = 8, max_len: int = 8192,
+    def __init__(self, model: str, drafter: str, block: int = 4, precision: str = "bf16", max_rows: int = 8, max_len: int = 8192,
                  window_step: int = 512, sync_every: int | None = None, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
         self.mps = dev.type == "mps"
+        if precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+        self.precision = precision
+        fp8 = precision == "fp8"
+        if fp8 and not (dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)):
+            raise ValueError("fp8 needs a CUDA GPU with compute capability 8.9 or higher")
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
@@ -49,7 +56,6 @@ class Engine:
             raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
         view.requires_grad_(False)
         self.dtype = base.lm_head.weight.dtype
-        fp8 = fp8 and dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)
         if fp8:
             from inference.fp8 import quantize, warm
             quantize(view)
@@ -67,7 +73,6 @@ class Engine:
                 store_transposed(proj)
         torch.accelerator.empty_cache()
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
-        self.fp8 = fp8
         self.cfg = cfg = base.cfg
         self.K = K = block
         self.J = J = K - 1

@@ -18,7 +18,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=3)
     a = ap.parse_args()
     benchmark([
-        "--model", a.model, "--drafter", a.weights, "--no-fp8", "--max-rows", "1",
+        "--model", a.model, "--drafter", a.weights, "--precision", "bf16", "--max-rows", "1",
         "--data", str(Path(a.data_dir) / "dev.jsonl"), "--limit", str(a.n), "--compare-ar", str(a.n),
         "--max-think", str(a.max_new), "--block", str(a.block),
         "--window-step", str(a.window_step), "--seed", str(a.seed),

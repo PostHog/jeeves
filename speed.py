@@ -101,15 +101,17 @@ def main() -> None:
     ap.add_argument("--eval", type=int, default=0)
     ap.add_argument("--save", default=None)
     ap.add_argument("--reference", default=None)
+    ap.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
     a = ap.parse_args()
     model = a.model or default_snapshot()
     records = read_jsonl(a.data)
-    engine = Engine(model, f"{model}/drafter_k4.safetensors", max_rows=MAX_ROWS, max_len=MAX_LEN)
+    engine = Engine(model, f"{model}/drafter_k4.safetensors", precision=a.precision, max_rows=MAX_ROWS, max_len=MAX_LEN)
     engine.answer(records[0], Options(max_think=16))
     if a.eval:
         summary, outputs = evaluate(engine, records, a.eval)
     else:
         summary, outputs = speed(engine, records)
+    summary["precision"] = engine.precision
     summary["driver_gb"] = round(torch.mps.driver_allocated_memory() / 1e9, 1) if engine.device.type == "mps" else None
     if a.reference:
         summary.update(compare(outputs, json.loads(Path(a.reference).read_text())))
