@@ -64,8 +64,28 @@ def masks() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def fp8_matmuls() -> list[str]:
+    failures = []
+    torch.manual_seed(1)
+    for N, K in ((4096, 4096), (1024, 12288)):
+        linear = FP8Linear.quantized(nn.Linear(K, N, bias=False, device=CUDA, dtype=torch.bfloat16))
+        dequantized = linear.weight.float() * linear.scale[:, None]
+        for M in (1, 4, 12, 16, 17, 48, 256):
+            x = torch.randn(M, K, device=CUDA, dtype=torch.bfloat16)
+            x[:, 0] = 1e5
+            reference = x.float() @ dequantized.t()
+            out = linear(x)
+            error = ((out.float() - reference).norm() / reference.norm()).item()
+            if not error <= 4e-3:
+                failures.append(f"FP8Linear {N}x{K} at {M} rows differs from float32 by {error:.2e}, more than bf16 rounding")
+            if not torch.equal(out, linear(x)):
+                failures.append(f"FP8Linear {N}x{K} at {M} rows gives different results on a second call")
+    return failures
+
+
 def main() -> None:
-    failures = merges() + masks()
+    failures = merges() + masks() + fp8_matmuls()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 
