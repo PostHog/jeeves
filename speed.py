@@ -13,7 +13,7 @@ import torch
 from huggingface_hub import try_to_load_from_cache
 
 from inference.engine import Engine
-from inference.types import Options
+from inference.types import PRECISIONS, Options
 from prep.format import DataFormat, read_jsonl
 
 RUNS = 6
@@ -101,7 +101,7 @@ def main() -> None:
     ap.add_argument("--eval", type=int, default=0)
     ap.add_argument("--save", default=None)
     ap.add_argument("--reference", default=None)
-    ap.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
+    ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     a = ap.parse_args()
     model = a.model or default_snapshot()
     records = read_jsonl(a.data)

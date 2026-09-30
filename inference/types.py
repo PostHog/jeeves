@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+PRECISIONS = ("bf16", "fp8")
+
 
 @dataclass
 class Options:

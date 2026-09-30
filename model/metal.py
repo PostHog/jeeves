@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 SIMD = 32
@@ -212,7 +214,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return out
 
 
-# Gated RMSNorm: one simdgroup per row, as in model.GatedRMSNorm.
+# Gated RMSNorm: one simdgroup per row.
 
 _GATED_RMS_NORM = r"""
 // Must round like model.GatedRMSNorm's eager path: the normalised value, its product with the weight, and the product with silu(z).
@@ -317,14 +319,14 @@ inline void cached_attention(device const bfloat* q, device const bfloat* k, dev
         if (!allowed[l])
             continue;
         float dot = 0.0f;
-        for (uint i = 0; i < DIMS_PER_LANE; ++i)
-            dot += qv[i] * float(kb[l * HKV * D + i]);
+        for (uint d = 0; d < DIMS_PER_LANE; ++d)
+            dot += qv[d] * float(kb[l * HKV * D + d]);
         const float score = simd_sum(dot) * scale;
         const float m_new = max(m, score);
         const float rescale = precise::exp(m - m_new), p = precise::exp(score - m_new);
         s = s * rescale + p;
-        for (uint i = 0; i < DIMS_PER_LANE; ++i)
-            o[i] = o[i] * rescale + p * float(vb[l * HKV * D + i]);
+        for (uint d = 0; d < DIMS_PER_LANE; ++d)
+            o[d] = o[d] * rescale + p * float(vb[l * HKV * D + d]);
         m = m_new;
     }
     if (lane == 0) {
@@ -369,42 +371,58 @@ kernel void cached_attention_##D(device const bfloat* q [[buffer(0)]], device co
 """ + "".join(f"CACHED_ATTENTION_KERNEL({D})\n" for D in ATTENTION_HEAD_DIMS)
 
 
-def _visited_extent(B: int, length: int, used_end: torch.Tensor | None, tail_start: int | None, device) -> tuple[torch.Tensor, int]:
-    if used_end is None:
-        return torch.full((B,), length, dtype=torch.long, device=device), length
+def _require_visited_extent(B: int, length: int, used_end: torch.Tensor, tail_start: int) -> None:
     _require("used_end", used_end, torch.long, (B,))
     if not 0 <= tail_start <= length:
         raise ValueError(f"tail_start {tail_start} is outside [0, {length}]")
-    return used_end.contiguous(), tail_start
+
+
+def _require_caches(k_cache: torch.Tensor, v_cache: torch.Tensor, B: int, length: int, D: int) -> int:
+    HKV = k_cache.shape[2]
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
+    # The kernels step through v_cache with k_cache's row stride, and the chunked kernel reads both with 16-byte vector loads.
+    if v_cache.shape != k_cache.shape or k_cache.storage_offset() % 8 or v_cache.storage_offset() % 8:
+        raise ValueError(f"k_cache and v_cache need the same shape and 16-byte aligned starts, got {tuple(k_cache.shape)} at offset "
+                         f"{k_cache.storage_offset()} and {tuple(v_cache.shape)} at offset {v_cache.storage_offset()}")
+    return HKV
 
 
 def cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float,
-                     used_end: torch.Tensor | None = None, tail_start: int | None = None) -> torch.Tensor:
+                     used_end: torch.Tensor, tail_start: int) -> torch.Tensor:
     B, Q, H, D = q.shape
     length = mask.shape[-1]
-    HKV = k_cache.shape[2]
     _require("q", q, torch.bfloat16)
     _require("mask", mask, torch.bool, (B, Q, length))
-    used_end, tail_start = _visited_extent(B, length, used_end, tail_start, q.device)
-    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
-        _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
+    _require_visited_extent(B, length, used_end, tail_start)
+    HKV = _require_caches(k_cache, v_cache, B, length, D)
     if D not in ATTENTION_HEAD_DIMS or H % HKV:
         raise ValueError(f"unsupported head layout: {H} query heads, {HKV} key/value heads, head dim {D}")
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    getattr(library(), f"cached_attention_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), used_end, out, Q, H, HKV, length, tail_start,
+    getattr(library(), f"cached_attention_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), used_end.contiguous(), out, Q, H, HKV, length, tail_start,
                                                 k_cache.stride(0), scale, threads=(SIMD * ATTENTION_SPLITS * Q, H, B),
                                                 group_size=(SIMD * ATTENTION_SPLITS, 1, 1))
     return out
 
 
-
-# Multi-query attention for several rows: each threadgroup takes one (row, kv head, chunk of positions) and the query rows that share that
-# kv head, so a chunk of the cache is read once for all of them. merge_attention_chunks then combines the chunks' partial softmaxes.
+# Chunked cached attention for several rows: each threadgroup takes one (row, kv head, chunk of positions) and the query heads, the
+# (query, head) pairs, that share that kv head, so a chunk of the cache is read once for all of them. merge_attention_chunks then
+# combines the chunks' partial softmaxes.
 
 CHUNK_POSITIONS = 256
-MULTI_QUERY_CONFIGS = {128: (2, 6, True), 256: (4, 7, False)}
 
-_MULTI_QUERY_ATTENTION = f"""
+
+class ChunkedAttentionConfig(NamedTuple):
+    query_heads_per_simdgroup: int
+    simdgroups: int
+    stage_keys: bool
+
+
+# Tuned on an M4 Pro with torch 2.14. D=256 cannot stage keys: its query tile and a staged key tile would need more than the 32 KB of
+# threadgroup memory. 4 x 4 query heads per threadgroup divide the attention layers' 64 query heads per kv head evenly.
+CHUNKED_ATTENTION_CONFIGS = {128: ChunkedAttentionConfig(2, 6, True), 256: ChunkedAttentionConfig(4, 4, False)}
+
+_CHUNKED_ATTENTION = f"""
 constant constexpr uint CHUNK_POSITIONS = {CHUNK_POSITIONS};
 """ + r"""
 inline float4 bf16x4(uint2 w) {
@@ -412,21 +430,21 @@ inline float4 bf16x4(uint2 w) {
 }
 
 // Scores: lane i owns position l0 + i of each 32-position block (K rows come from threadgroup memory when STAGE_K, padded against bank
-// conflicts, or straight from device memory). Values: lanes split D, so value rows are read coalesced. Simdgroup s owns QPS query rows.
+// conflicts, or straight from device memory). Values: lanes split D, so value rows are read coalesced. Simdgroup s owns QPS query heads.
 template <uint D, uint QPS, uint NSG, bool STAGE_K>
-inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
+inline void chunked_attention(device const bfloat* q, device const bfloat* k, device const bfloat* v, device const bool* mask,
                               device const long* used_end, device float* part_max, device float* part_sum, device float* part_out, uint Q,
-                              uint H, uint HKV, uint L, uint tail_start, uint row_stride, float scale, uint n_chunks, uint n_row_groups,
+                              uint H, uint HKV, uint L, uint tail_start, uint row_stride, float scale, uint n_chunks, uint n_query_groups,
                               uint3 tg, uint sg, uint lane, uint tid,
                               threadgroup float* qs, threadgroup bfloat* ks) {
-    constexpr uint DIMS_PER_LANE = D / SIMD, K_PITCH = D + 8, ROWS_PER_GROUP = NSG * QPS;
-    const uint chunk = tg.x / n_row_groups, row_group = tg.x % n_row_groups, kv_head = tg.y, b = tg.z;
-    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, r0 = row_group * ROWS_PER_GROUP + sg * QPS;
+    constexpr uint DIMS_PER_LANE = D / SIMD, K_PITCH = D + 8, QUERY_HEADS_PER_GROUP = NSG * QPS;
+    const uint chunk = tg.x / n_query_groups, query_group = tg.x % n_query_groups, kv_head = tg.y, b = tg.z;
+    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, qh0 = query_group * QUERY_HEADS_PER_GROUP + sg * QPS;
     threadgroup float* my_q = qs + sg * QPS * D;
     for (uint j = 0; j < QPS; ++j) {
-        const uint r = r0 + j, qi = r / heads_per_kv, h = kv_head * heads_per_kv + r % heads_per_kv;
+        const uint qh = qh0 + j, qi = qh / heads_per_kv, h = kv_head * heads_per_kv + qh % heads_per_kv;
         for (uint d = lane; d < D; d += SIMD)
-            my_q[j * D + d] = r < G ? float(q[((b * Q + qi) * H + h) * D + d]) : 0.0f;
+            my_q[j * D + d] = qh < G ? float(q[((b * Q + qi) * H + h) * D + d]) : 0.0f;
     }
     device const bfloat* kb = k + b * row_stride + kv_head * D;
     device const bfloat* vb = v + b * row_stride + kv_head * D + lane * DIMS_PER_LANE;
@@ -467,8 +485,8 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
         }
         float p[QPS];
         for (uint j = 0; j < QPS; ++j) {
-            const uint r = r0 + j, qi = r < G ? r / heads_per_kv : 0;
-            const bool allowed = in_chunk && r < G && mask[(b * Q + qi) * L + l];
+            const uint qh = qh0 + j, qi = qh < G ? qh / heads_per_kv : 0;
+            const bool allowed = in_chunk && qh < G && mask[(b * Q + qi) * L + l];
             const float sc = allowed ? score[j] * scale : -INFINITY;
             const float m_new = max(m[j], simd_max(sc));
             if (m_new == -INFINITY) {
@@ -494,10 +512,10 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
         }
     }
     for (uint j = 0; j < QPS; ++j) {
-        const uint r = r0 + j;
-        if (r >= G)
+        const uint qh = qh0 + j;
+        if (qh >= G)
             continue;
-        const uint idx = ((b * HKV + kv_head) * G + r) * n_chunks + chunk;
+        const uint idx = ((b * HKV + kv_head) * G + qh) * n_chunks + chunk;
         if (lane == 0) {
             part_max[idx] = m[j];
             part_sum[idx] = s[j];
@@ -507,14 +525,14 @@ inline void multi_query_chunk(device const bfloat* q, device const bfloat* k, de
     }
 }
 
-// One simdgroup per (row, kv head, query row); a query with no allowed position gets 0, as SDPA returns on MPS.
+// One simdgroup per (row, kv head, query head); a query with no allowed position gets 0, as SDPA returns on MPS.
 template <uint D>
 inline void merge_attention_chunks(device const float* part_max, device const float* part_sum, device const float* part_out, device bfloat* out,
                                    uint Q, uint H, uint HKV, uint n_chunks, uint3 tg, uint lane) {
     constexpr uint DIMS_PER_LANE = D / SIMD;
-    const uint r = tg.x, kv_head = tg.y, b = tg.z;
-    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, qi = r / heads_per_kv, h = kv_head * heads_per_kv + r % heads_per_kv;
-    const uint base = ((b * HKV + kv_head) * G + r) * n_chunks;
+    const uint qh = tg.x, kv_head = tg.y, b = tg.z;
+    const uint heads_per_kv = H / HKV, G = Q * heads_per_kv, qi = qh / heads_per_kv, h = kv_head * heads_per_kv + qh % heads_per_kv;
+    const uint base = ((b * HKV + kv_head) * G + qh) * n_chunks;
     float m_all = -INFINITY;
     for (uint c = 0; c < n_chunks; ++c)
         m_all = max(m_all, part_max[base + c]);
@@ -533,18 +551,18 @@ inline void merge_attention_chunks(device const float* part_max, device const fl
         out[((b * Q + qi) * H + h) * D + lane * DIMS_PER_LANE + d] = bfloat(s_all > 0.0f ? o_all[d] / s_all : 0.0f);
 }
 
-#define MULTI_QUERY_KERNELS(D, QPS, NSG, STAGE_K) \
-kernel void multi_query_chunk_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], device const bfloat* v [[buffer(2)]], \
+#define CHUNKED_ATTENTION_KERNELS(D, QPS, NSG, STAGE_K) \
+kernel void chunked_attention_##D(device const bfloat* q [[buffer(0)]], device const bfloat* k [[buffer(1)]], device const bfloat* v [[buffer(2)]], \
         device const bool* mask [[buffer(3)]], device float* part_max [[buffer(4)]], device float* part_sum [[buffer(5)]], \
         device float* part_out [[buffer(6)]], device const long* used_end [[buffer(7)]], constant long& Q [[buffer(8)]], \
         constant long& H [[buffer(9)]], constant long& HKV [[buffer(10)]], constant long& L [[buffer(11)]], constant long& tail_start [[buffer(12)]], \
         constant long& row_stride [[buffer(13)]], constant float& scale [[buffer(14)]], constant long& n_chunks [[buffer(15)]], \
-        constant long& n_row_groups [[buffer(16)]], uint3 tg [[threadgroup_position_in_grid]], \
+        constant long& n_query_groups [[buffer(16)]], uint3 tg [[threadgroup_position_in_grid]], \
         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup float qs[QPS * NSG * D]; \
     threadgroup bfloat ks[STAGE_K ? SIMD * (D + 8) : 1]; \
-    multi_query_chunk<D, QPS, NSG, STAGE_K>(q, k, v, mask, used_end, part_max, part_sum, part_out, uint(Q), uint(H), uint(HKV), uint(L), \
-                                            uint(tail_start), uint(row_stride), scale, uint(n_chunks), uint(n_row_groups), tg, sg, lane, tid, qs, ks); \
+    chunked_attention<D, QPS, NSG, STAGE_K>(q, k, v, mask, used_end, part_max, part_sum, part_out, uint(Q), uint(H), uint(HKV), uint(L), \
+                                            uint(tail_start), uint(row_stride), scale, uint(n_chunks), uint(n_query_groups), tg, sg, lane, tid, qs, ks); \
 } \
 kernel void merge_attention_chunks_##D(device const float* part_max [[buffer(0)]], device const float* part_sum [[buffer(1)]], \
         device const float* part_out [[buffer(2)]], device bfloat* out [[buffer(3)]], constant long& Q [[buffer(4)]], constant long& H [[buffer(5)]], \
@@ -552,51 +570,53 @@ kernel void merge_attention_chunks_##D(device const float* part_max [[buffer(0)]
         uint lane [[thread_index_in_simdgroup]]) { \
     merge_attention_chunks<D>(part_max, part_sum, part_out, out, uint(Q), uint(H), uint(HKV), uint(n_chunks), tg, lane); \
 }
-""" + "".join(f"MULTI_QUERY_KERNELS({D}, {qps}, {nsg}, {'true' if stage else 'false'})\n" for D, (qps, nsg, stage) in MULTI_QUERY_CONFIGS.items())
+""" + "".join(f"CHUNKED_ATTENTION_KERNELS({D}, {qps}, {nsg}, {'true' if stage else 'false'})\n" for D, (qps, nsg, stage) in CHUNKED_ATTENTION_CONFIGS.items())
 
 
-def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float,
-                          used_end: torch.Tensor | None = None, tail_start: int | None = None) -> torch.Tensor:
+def chunked_cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float,
+                             used_end: torch.Tensor, tail_start: int) -> torch.Tensor:
     B, Q, H, D = q.shape
     length = mask.shape[-1]
-    HKV = k_cache.shape[2]
     _require("q", q, torch.bfloat16)
     _require("mask", mask, torch.bool, (B, Q, length))
-    used_end, tail_start = _visited_extent(B, length, used_end, tail_start, q.device)
-    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
-        _require_buffer(name, cache, torch.bfloat16, at_least=(B, length), then=(HKV, D))
-    if D not in MULTI_QUERY_CONFIGS or H % HKV:
+    _require_visited_extent(B, length, used_end, tail_start)
+    HKV = _require_caches(k_cache, v_cache, B, length, D)
+    if D not in CHUNKED_ATTENTION_CONFIGS or H % HKV:
         raise ValueError(f"unsupported head layout: {H} query heads, {HKV} key/value heads, head dim {D}")
-    qps, nsg, _ = MULTI_QUERY_CONFIGS[D]
+    qps, nsg, _ = CHUNKED_ATTENTION_CONFIGS[D]
     G = Q * (H // HKV)
-    n_row_groups = -(-G // (qps * nsg))
+    n_query_groups = -(-G // (qps * nsg))
     n_chunks = -(-length // CHUNK_POSITIONS)
     part_max = torch.empty(B * HKV * G * n_chunks, dtype=torch.float32, device=q.device)
     part_sum = torch.empty_like(part_max)
     part_out = torch.empty(B * HKV * G * n_chunks * D, dtype=torch.float32, device=q.device)
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    getattr(library(), f"multi_query_chunk_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), part_max, part_sum, part_out, used_end, Q,
-                                                  H, HKV, length, tail_start, k_cache.stride(0), scale, n_chunks, n_row_groups,
-                                                  threads=(n_chunks * n_row_groups * nsg * SIMD, HKV, B), group_size=(nsg * SIMD, 1, 1))
+    getattr(library(), f"chunked_attention_{D}")(q.contiguous(), k_cache, v_cache, mask.contiguous(), part_max, part_sum, part_out, used_end.contiguous(), Q,
+                                                  H, HKV, length, tail_start, k_cache.stride(0), scale, n_chunks, n_query_groups,
+                                                  threads=(n_chunks * n_query_groups * nsg * SIMD, HKV, B), group_size=(nsg * SIMD, 1, 1))
     getattr(library(), f"merge_attention_chunks_{D}")(part_max, part_sum, part_out, out, Q, H, HKV, n_chunks,
                                                        threads=(G * SIMD, HKV, B), group_size=(SIMD, 1, 1))
     return out
 
 
 # FP8 linear (w8a16): y = x @ (codes * scale).T with float accumulation and one rounding to bf16, the math of inference/fp8.py's
-# w8a16 kernel. A simdgroup owns FP8_TILE_FEATURES output features and FP8_TILE_ROWS rows of x.
+# w8a16 kernel. A simdgroup owns FP8_TILE_FEATURES output features and FP8_TILE_ROWS rows of x. The kernel's layout fixes these three
+# sizes: two simdgroup_float8x8 accumulators, and 16-byte code loads by the 4 lanes that share a fragment row.
 
 FP8_TILE_FEATURES = 16
 FP8_TILE_ROWS = 8
 FP8_BLOCK_K = 64
 FP8_SIMDGROUPS = 4
 FP8_K_SPLITS = 4
+FP8_MERGE_THREADS = 256
 
 _FP8_LINEAR = f"""
-constant constexpr uint FP8_TILE_FEATURES = {FP8_TILE_FEATURES}, FP8_BLOCK_K = {FP8_BLOCK_K};
+constant constexpr uint FP8_TILE_FEATURES = {FP8_TILE_FEATURES}, FP8_TILE_ROWS = {FP8_TILE_ROWS}, FP8_BLOCK_K = {FP8_BLOCK_K};
 """ + r"""
+constant constexpr float UNDO_FP8_DECODE_SCALE = 256.0f;
+
 // Four e4m3fn codes as their values times 2^-8: the sign moves to fp16 bit 15 and the exponent and mantissa to bits 13..7, which
-// is exact for every code, subnormals included. even gets bytes 0 and 2 of word, odd gets bytes 1 and 3.
+// is exact for every finite code, subnormals included. even gets bytes 0 and 2 of word, odd gets bytes 1 and 3.
 inline void fp8x4_times_2_pow_minus_8(uint word, thread float2& even, thread float2& odd) {
     even = float2(as_type<half2>(((word & 0x00800080u) << 8) | ((word & 0x007F007Fu) << 7)));
     odd = float2(as_type<half2>((word & 0x80008000u) | ((word & 0x7F007F00u) >> 1)));
@@ -609,7 +629,7 @@ inline void fp8_linear_tile(device const bfloat* x, device const uchar* w, devic
                             uint M, uint N, uint K, uint k_per_part, uint3 tg, uint sg, uint sgs, uint lane) {
     const uint n0 = (tg.x * sgs + sg) * FP8_TILE_FEATURES;
     if (n0 >= N) return;
-    const uint m0 = tg.z * 8, part = tg.y;
+    const uint m0 = tg.z * FP8_TILE_ROWS, part = tg.y;
     const uint quad = lane / 4;
     const uint frag_row = (quad & 4) + ((lane / 2) % 4);
     const uint frag_col = (quad & 2) * 2 + (lane % 2) * 2;
@@ -649,7 +669,7 @@ inline void fp8_linear_tile(device const bfloat* x, device const uchar* w, devic
             if (PARTIAL)
                 ((device float*)y)[(ulong(part) * M + m) * N + n] = v;
             else
-                ((device bfloat*)y)[ulong(m) * N + n] = bfloat(v * (scale[n] * 256.0f));
+                ((device bfloat*)y)[ulong(m) * N + n] = bfloat(v * (scale[n] * UNDO_FP8_DECODE_SCALE));
         }
     }
 }
@@ -676,7 +696,7 @@ kernel void fp8_linear_merge(device const float* parts [[buffer(0)]], device con
     float acc = 0.0f;
     for (uint p = 0; p < uint(splits); ++p)
         acc += parts[ulong(p) * ulong(MN) + i];
-    y[i] = bfloat(acc * (scale[i % uint(N)] * 256.0f));
+    y[i] = bfloat(acc * (scale[i % uint(N)] * UNDO_FP8_DECODE_SCALE));
 }
 """
 
@@ -697,7 +717,7 @@ def fp8_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor) -> tor
     row_tiles = -(-M // FP8_TILE_ROWS)
     groups = -(-N // (FP8_TILE_FEATURES * FP8_SIMDGROUPS))
     simdgroups = row_tiles * N // FP8_TILE_FEATURES
-    # Measured on an M4 Pro: splitting k pays off once there are too few simdgroups to keep the GPU busy through the whole k loop.
+    # Tuned on an M4 Pro with torch 2.14: below K / 8 simdgroups, splitting k keeps more of the GPU busy than the merge costs.
     splits = FP8_K_SPLITS if simdgroups <= K // 8 else 1
     grid = {"threads": (groups * FP8_SIMDGROUPS * SIMD, splits, row_tiles), "group_size": (FP8_SIMDGROUPS * SIMD, 1, 1)}
     scale = scale.contiguous()
@@ -706,11 +726,11 @@ def fp8_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor) -> tor
         return out
     parts = torch.empty(splits, M, N, dtype=torch.float32, device=x.device)
     library().fp8_linear_partial(x2, codes, scale, parts, M, N, K, K // splits, **grid)
-    library().fp8_linear_merge(parts, scale, out, M * N, N, splits, threads=(M * N, 1, 1), group_size=(256, 1, 1))
+    library().fp8_linear_merge(parts, scale, out, M * N, N, splits, threads=(M * N, 1, 1), group_size=(FP8_MERGE_THREADS, 1, 1))
     return out
 
 
-SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _GATED_RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION + _FP8_LINEAR
+SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _GATED_RMS_NORM + _ROTARY + _CACHED_ATTENTION + _CHUNKED_ATTENTION + _FP8_LINEAR
 _library = None
 
 

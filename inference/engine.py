@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from export import load_export
-from inference.types import Options, Result
+from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
 from model.model import apply_rotary, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled
@@ -17,7 +17,6 @@ from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
-PRECISIONS = ("bf16", "fp8")
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
@@ -46,8 +45,10 @@ class Engine:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
         self.precision = precision
         fp8 = precision == "fp8"
-        if fp8 and not (self.metal if self.mps else dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)):
-            raise ValueError("fp8 needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels on")
+        fp8_supported = self.metal if self.mps else (dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9))
+        if fp8 and not fp8_supported:
+            raise ValueError("precision='fp8' needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels enabled "
+                             "(unset QWEN35_KERNELS=0)")
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
@@ -145,14 +146,13 @@ class Engine:
         else:
             state.copy_(delta_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), state, True)[1])
 
-    def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor, tail_start: int) -> torch.Tensor:
+    def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor | None, tail_start: int) -> torch.Tensor:
         B, length = q.shape[0], mask.shape[-1]
         gqa = q.shape[2] != k_cache.shape[2]
         if self.metal:
-            # The single-row kernel re-reads a head's cache for each of its queries, and the multi-query kernel reads it once for all of them.
-            # On torch 2.14 the multi-query kernel wins from 2 rows for the delta layers' 12 queries per head, and from 4 rows for attention.
+            # Tuned on an M4 Pro with torch 2.14: the chunked kernel wins from 2 rows for the delta layers' mask queries, and from 4 rows for attention.
             if B >= (4 if gqa else 2):
-                return metal.multi_query_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
+                return metal.chunked_cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
             return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
         keys, vals = k_cache[:B, :length], v_cache[:B, :length]
         with sdpa_kernel(EFFICIENT):
@@ -165,7 +165,7 @@ class Engine:
         return (hc.contiguous() if self.mps else hc), hm
 
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
-        if not self.mps or self.precision == "fp8":
+        if not self.mps or not isinstance(self.base.lm_head, nn.Linear):
             return self.base.lm_head(h)
         # MPS in torch 2.14 picks a slow kernel for the 248k-row matmul; row chunks of the weight give bitwise-equal logits much faster.
         return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
@@ -244,7 +244,7 @@ class Engine:
         pos = torch.cat((pos_c, n[:, None] + self.mask_offset[None]), dim=1)
         cos, sin = base.model.rotary_emb(pos)
         cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:]))
-        cache_used = n + K
+        used_end = n + K if self.metal else None
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
@@ -276,7 +276,7 @@ class Engine:
                 vm = view.delta_v[key](hm).view(B, M, Hv, Dv)
                 self.dk[i][:B, Lw:Lw + M] = km
                 self.dv[i][:B, Lw:Lw + M] = vm
-                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, cache_used, Lw)
+                o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
                 o = lin.norm(o.reshape(-1, Dv), z.reshape(-1, Dv)).view(B, K + M, lin.value_dim)
@@ -295,7 +295,7 @@ class Engine:
                 self.v[i][rows, pos_c] = att.v_proj(hc).view(B, K, Hkv, D)
                 self.k[i][:B, Lw:Lw + M] = k[:, K:]
                 self.v[i][:B, Lw:Lw + M] = view.attn_v[key](hm).view(B, M, Hkv, D)
-                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, cache_used, Lw)
+                o = self.cached_attention(q, self.k[i], self.v[i], mask, att.scaling, used_end, Lw)
                 o = o.reshape(B, K + M, H * D) * torch.sigmoid(torch.cat((gc, gm), 1).reshape(B, K + M, H * D))
                 x = x + att.o_proj(o)
             x = x + layer.mlp(layer.post_attention_layernorm(x))

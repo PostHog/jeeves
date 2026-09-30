@@ -128,7 +128,7 @@ class GatedRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         if _on("rms_norm_gated", x):
             return _fla_rms_norm_gated(x, z, self.weight, None, activation="swish", eps=self.eps)
-        if _on_metal(x, z, self.weight):
+        if x.shape == z.shape and _on_metal(x, z, self.weight):
             return metal.gated_rms_norm(x, z, self.weight, self.eps)
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)

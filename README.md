@@ -19,7 +19,7 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 - Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev).
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
 - About 0.3 s per request without thinking and a 3.3 s median with it on one H100 with `--precision fp8`. Can be sped up by truncating chain length.
-- Runs on CUDA in bf16, or with FP8 linear layers on Hopper (`--precision fp8`). Inference also runs on Apple Silicon (MPS, bf16).
+- Runs on CUDA in bf16, or with FP8 linear layers (`--precision fp8`) on GPUs with compute capability 8.9 or higher. Inference also runs on Apple Silicon (MPS) in bf16 or FP8.
 
 ## Problem
 
@@ -77,7 +77,11 @@ On a Mac, the engine runs on MPS. The weights use 21 GB in bf16. The default cac
 python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafter_k4.safetensors --max-rows 4 --max-len 4096 --port 8009
 ```
 
-On an M4 Pro, one question thinks at about 19 tokens per second, and a request without thinking takes 0.3 to 0.5 s. `--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal kernel. The weights then use 11.5 GB and one question thinks at about 31 tokens per second, but the outputs change slightly. `python -m model.metal_test` checks the Metal kernels against float64 and eager references, and `python speed.py --data data/dev.jsonl` times a fixed set of dev requests.
+On an M4 Pro, one question thinks at about 20 tokens per second, and a request without thinking takes 0.3 to 0.5 s.
+
+`--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay bf16 at every size, while CUDA also quantizes them above 256 rows. The weights then use 11.5 GB, and one question thinks at about 31 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
+
+`python -m model.metal_test` checks the Metal kernels against float64 and eager references. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
 
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 
@@ -168,7 +172,7 @@ The client connects to `http://127.0.0.1:8009` by default (or `JEEVES_BASE_URL`)
 | `nothink_threshold` | `null`  | answers without thinking when the no-think confidence is at least this value |
 | `return_reasoning`  | `false` | adds each question's reasoning text to the response                          |
 
-On 325 dev questions:
+On 325 dev questions, on one H100 with `--precision fp8`:
 
 | setting                                  | accuracy | mean reasoning tokens | median / p90 latency |
 | ---------------------------------------- | -------- | --------------------- | -------------------- |
@@ -258,20 +262,21 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 
 | path                                     | contents                                                                            |
 | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| `model/`                                 | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head                      |
+| `model/`                                 | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head, Metal kernels       |
 | `loader/`                                | prompt format, tokenisation and batching                                            |
 | `prep/`                                  | dataset construction (`prep.py`) and synthetic generators                           |
 | `trainer.py`, `train.py`                 | SFT, CISPO and drafter training                                                     |
 | `test.py`, `jevbench.py`, `calibrate.py` | evaluation, JevBench, temperature fitting                                           |
 | `export.py`                              | fuses LoRA into a standalone model with the head and temperature                    |
 | `drafter/`                               | drafter model, chain sampling, fused speculative decoder                            |
-| `inference/`                             | FP8 kernel, batched speculative engine, Jev-compatible server and benchmark         |
+| `inference/`                             | FP8 linears (CUDA, Metal), batched speculative engine, server and benchmark         |
+| `speed.py`                               | fixed speed and equivalence harness for MPS                                         |
 | `sdk/`                                   | `jeeves_sdk`, a drop-in replacement for Jev's Python SDK with the reasoning options |
 
 ## Limitations
 
 - Knowledge questions trail Jev (MMLU 0.793 vs 0.900, MMLU-Pro 0.739 vs 0.840).
-- Thinking is slow at the tail: 17 s at p90 with full chains. Use `max_think` and `nothink_threshold` when latency matters.
+- Thinking is slow at the tail: 17 s at p90 with full chains on one H100. Use `max_think` and `nothink_threshold` when latency matters.
 - The Kev and Jev comparisons outside JevBench use different items from the same sources.
 - No language consistency reward was included so thinking chains are not well interpretable.
 

@@ -11,7 +11,7 @@ import torch
 
 from inference.api import MODEL_ID, parse_request, response
 from inference.engine import Engine
-from inference.types import Options
+from inference.types import PRECISIONS, Options
 from prep.format import DataFormat, Question
 
 RELEASE_DATE = "2026-09-29"
@@ -76,7 +76,7 @@ def main() -> None:
     ap.add_argument("--model", default="runs/fused")
     ap.add_argument("--drafter", default="runs/drafter_k4/drafter.safetensors")
     ap.add_argument("--block", type=int, default=4)
-    ap.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
+    ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     ap.add_argument("--max-rows", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=8192)
     ap.add_argument("--max-think", type=int, default=2560)

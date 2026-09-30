@@ -4,6 +4,8 @@ import sys
 
 import torch
 
+from inference.fp8_metal import MetalFP8Linear, check_kernel_on_every_code
+from inference.fp8_weights import quantize_rows
 from model import metal
 from model.model import GatedRMSNorm, RMSNorm, apply_rotary, set_kernels, torch_recurrent_gated_delta_rule
 
@@ -161,25 +163,26 @@ def exact_attention(q, k_cache, v_cache, mask, scale):
 def attention() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(3)
-    cases = [(kernel, 1, *case) for kernel in (metal.cached_attention,) for case in
+    cases = [(metal.cached_attention, 1, *case) for case in
              ((32, 32, 128, 12, 524, 1), (32, 32, 128, 12, 524, 8), (16, 4, 256, 16, 524, 8), (32, 32, 128, 12, 2572, 1), (16, 4, 256, 16, 2572, 8))]
-    cases += [(metal.multi_query_attention, 3, *case) for case in ((32, 32, 128, 12, 524, 8), (16, 4, 256, 16, 700, 8), (32, 32, 128, 12, 2572, 1))]
+    cases += [(metal.chunked_cached_attention, B, *case) for B, case in
+              ((3, (32, 32, 128, 12, 524, 8)), (3, (16, 4, 256, 16, 700, 8)), (3, (32, 32, 128, 12, 2572, 1)), (2, (16, 4, 256, 16, 2572, 1)))]
     for kernel, B, H, HKV, D, Q, L, peak in cases:
         k_cache, v_cache = (torch.randn(B + 1, L + 40, HKV, D, generator=gen).to(torch.bfloat16) for _ in range(2))
         q = (torch.randn(B, Q, H, D, generator=gen) * peak).to(torch.bfloat16)
         full_mask = torch.rand(B, 1, 4 + Q, L, generator=gen) < 0.9
         full_mask[..., 0] = True
         full_mask[0, 0, 4 + 1] = False
-        used_end = torch.randint(L // 3, L - 12, (B,), generator=gen)
         tail_start = L - 12
+        used_end = torch.randint(L // 3, tail_start, (B,), generator=gen)
         for b, used in enumerate(used_end.tolist()):
             full_mask[b, :, :, used:tail_start] = False
         mask = full_mask[:, :, 4:][:, 0]
         exact = exact_attention(q, k_cache, v_cache, mask, D ** -0.5)
         on = lambda t: t.to(MPS)
         out = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5, on(used_end), tail_start).cpu()
-        without_extent = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5).cpu()
-        if ((out.float() - without_extent.float()).abs() > without_extent.float().abs() * 2 ** -7 + 1e-3).any():
+        without_extent = kernel(on(q), on(k_cache), on(v_cache), on(full_mask)[:, :, 4:][:, 0], D ** -0.5, on(torch.full((B,), L)), L).cpu()
+        if ((out.float() - without_extent.float()).abs() > without_extent.float().abs() * torch.finfo(torch.bfloat16).eps + 1e-3).any():
             failures.append(f"{kernel.__name__} D={D} L={L} changes by more than one rounding when it skips the masked gap")
         live = mask.any(-1)
         sdpa = torch.nn.functional.scaled_dot_product_attention(
@@ -200,22 +203,18 @@ def attention() -> list[str]:
 def fp8() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(6)
-    codes = torch.arange(256, dtype=torch.uint8)
-    finite = codes[~codes.view(torch.float8_e4m3fn).float().isnan()]
-    lookup = finite[(torch.arange(256)[:, None] + torch.arange(256)[None]) % len(finite)]
-    picked = metal.fp8_linear(torch.eye(256, dtype=torch.bfloat16, device=MPS), lookup.to(MPS), torch.ones(256, device=MPS)).cpu()
-    if not torch.equal(picked.float(), lookup.view(torch.float8_e4m3fn).float().t()):
-        failures.append("fp8_linear does not decode every finite e4m3fn code exactly")
+    try:
+        check_kernel_on_every_code(MPS)
+    except RuntimeError as e:
+        failures.append(str(e))
     for shape, K, N in (((1,), 256, 16), ((3,), 4096, 1024), ((12,), 4096, 4096), ((2, 8), 12288, 4096), ((37,), 4096, 8192), ((300,), 1024, 2048)):
-        w = torch.randn(N, K, generator=gen) * 0.02
-        scale = w.abs().amax(1) / torch.finfo(torch.float8_e4m3fn).max
-        w8 = (w / scale[:, None]).to(torch.float8_e4m3fn)
+        w8, scale = quantize_rows(torch.randn(N, K, generator=gen) * 0.02)
         x = torch.randn(*shape, K, generator=gen).to(torch.bfloat16)
-        master_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
+        triton_w8a16_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
         out = metal.fp8_linear(x.to(MPS), w8.view(torch.uint8).to(MPS), scale.to(MPS)).cpu()
         weights = w8.double() * scale.double()[:, None]
         exact, magnitude = x.double() @ weights.t(), x.double().abs() @ weights.abs().t()
-        equal = (out == master_math).float().mean().item()
+        equal = (out == triton_w8a16_math).float().mean().item()
         print(f"fp8_linear x {tuple(x.shape)} K={K} N={N}: bitwise equal to the w8a16 math of inference/fp8.py {equal:.5f}")
         # Half a bf16 rounding plus room for float accumulation, which dominates only where the terms cancel.
         if equal < 0.999 or ((out.double() - exact).abs() > exact.abs() * 2 ** -8 + magnitude * 2 ** -20).any():
@@ -227,6 +226,14 @@ def fp8() -> list[str]:
             failures.append(f"fp8_linear accepted K={K} N={N}")
         except ValueError:
             pass
+    linear = torch.nn.Linear(4096, 1024 + 16, bias=True, dtype=torch.bfloat16)
+    codes, scale = quantize_rows(linear.weight)
+    quantized = MetalFP8Linear(linear.to(MPS))
+    x = torch.randn(3, 4096, generator=gen).to(torch.bfloat16).to(MPS)
+    if not torch.equal(quantized.codes.cpu(), codes.view(torch.uint8)) or not torch.equal(quantized.scale.cpu(), scale):
+        failures.append("MetalFP8Linear's codes or scales differ from quantize_rows")
+    if not torch.equal(quantized(x), metal.fp8_linear(x, quantized.codes, quantized.scale) + linear.bias):
+        failures.append("MetalFP8Linear does not add its bias to fp8_linear")
     return failures
 
 

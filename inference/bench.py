@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from inference.types import Options
+from inference.types import PRECISIONS, Options
 from prep.format import read_jsonl
 
 if TYPE_CHECKING:
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--model", default="runs/fused")
     ap.add_argument("--drafter", default="runs/drafter_k4/drafter.safetensors")
     ap.add_argument("--block", type=int, default=4)
-    ap.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
+    ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     ap.add_argument("--data", default="data/dev.jsonl")
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
