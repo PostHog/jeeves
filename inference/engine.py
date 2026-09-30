@@ -12,18 +12,16 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, delta_gates, gated_delta_rule_advance, gated_delta_rule_chunk,
+from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, delta_gates, gated_delta_rule_advance_inplace, gated_delta_rule_chunk,
                          gated_delta_rule_step, metal_enabled)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
+# SDPA's efficient kernel pads a copy of any mask whose row stride is not aligned, in every call.
+MASK_ROW_ALIGNMENT = 16
 # Longer passes run eagerly at their exact length: there the GPU work outweighs the launch cost a graph removes, and padding would add to it.
 EXTEND_GRAPH_LENGTHS = (32, 64, 128, 256, 512, 1024, 1536, 2048)
-
-
-def delta_step(q, k, v, g, beta, state, final: bool):
-    return gated_delta_rule_step(q, k, v, g, beta, initial_state=state, output_final_state=final)
 
 
 def store_transposed(linear: nn.Linear) -> None:
@@ -54,8 +52,7 @@ def freeze_rms_norms(module: nn.Module) -> None:
 
 
 def additive_mask(allowed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    # SDPA converts a boolean mask to an additive one in every call, and pads a mask whose row stride is not aligned, so both are done once here.
-    padded = -(-allowed.shape[-1] // 16) * 16
+    padded = -(-allowed.shape[-1] // MASK_ROW_ALIGNMENT) * MASK_ROW_ALIGNMENT
     mask = torch.full((*allowed.shape[:-1], padded), float("-inf"), dtype=dtype, device=allowed.device)[..., :allowed.shape[-1]]
     return mask.masked_fill_(allowed, 0.0)
 
@@ -71,7 +68,7 @@ def common_prefix(seqs: list[list[int]]) -> int:
 
 class Engine:
     def __init__(self, model: str, drafter: str, block: int = 4, precision: str = "bf16", max_rows: int = 8, max_len: int = 8192,
-                 window_step: int = 512, sync_every: int | None = None, device: str | None = None):
+                 window_step: int = 512, sync_every: int = 1, device: str | None = None):
         self.device = dev = torch.device(device) if device else torch.accelerator.current_accelerator()
         self.mps, self.cuda = dev.type == "mps", dev.type == "cuda"
         if precision not in PRECISIONS:
@@ -107,8 +104,7 @@ class Engine:
                     store_transposed(proj)
             for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
                 store_transposed(proj)
-        # On CUDA, projections that read the same input run as one GEMM, which saves launches and reads the input once. In fp8, in_proj_b
-        # and in_proj_a stay bf16, so a delta layer's group falls back to merging just that pair.
+        # On CUDA, projections that read the same input run as one GEMM, which saves launches and reads the input once. In fp8, in_proj_b and in_proj_a stay bf16, so a delta layer's group falls back to merging just that pair.
         self.merged_projections: dict[tuple[int, ...], nn.Module] = {}
         if self.cuda:
             groups = [(layer.linear_attn.in_proj_qkv, layer.linear_attn.in_proj_b, layer.linear_attn.in_proj_a) if layer.layer_type == LINEAR
@@ -135,8 +131,10 @@ class Engine:
         self.R, self.L = max_rows, max_len
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
-        # Each unneeded cycle after the last row finishes costs a full forward, which is more than a host sync costs, also with CUDA graphs.
-        self.window_step, self.sync_every = window_step, sync_every or 1
+        if sync_every < 1:
+            raise ValueError(f"sync_every must be at least 1, got {sync_every}")
+        # A host sync leaves the GPU idle for a short gap in every cycle, while syncing every n cycles runs up to n - 1 full cycles after the last row finishes, so syncing every cycle wins unless a decode runs more cycles than about twice a cycle's time divided by a sync gap.
+        self.window_step, self.sync_every = window_step, sync_every
         self.eos = encoder.think_end_id
         self.pad = encoder.pad_id
         self.opt_end = encoder.opt_end_id
@@ -166,7 +164,7 @@ class Engine:
         self.ar_k = torch.arange(K, device=dev)
         self.ar_j = torch.arange(J, device=dev)
         self.ar_l = torch.arange(max_len + 1, device=dev)
-        self.ar_conv = torch.arange(cfg.linear_conv_kernel_dim, device=dev)
+        self.ar_conv_kernel = torch.arange(cfg.linear_conv_kernel_dim, device=dev)
         block_of_mask = torch.arange(K, device=dev).repeat_interleave(J)
         self.mask_offset = block_of_mask + (self.ar_j + 1).repeat(K)
         self.limit_offset = torch.cat((self.ar_k, block_of_mask))
@@ -202,13 +200,16 @@ class Engine:
     def delta_outputs(self, q, k, v, g, beta, state) -> torch.Tensor:
         if self.metal:
             return metal.gated_delta_rule_outputs(q, k, v, g, beta, state)
-        return delta_step(q, k, v, g, beta, state, False)[0]
+        return gated_delta_rule_step(q, k, v, g, beta, initial_state=state, output_final_state=False)[0]
 
     def delta_commit(self, k, v, g, beta, state, accepted) -> None:
         if self.metal:
             metal.gated_delta_rule_advance_inplace(k, v, g, beta, state, accepted)
         else:
-            gated_delta_rule_advance(k, v, g, beta, state, accepted)
+            gated_delta_rule_advance_inplace(k, v, g, beta, state, accepted)
+
+    def attention_mask(self, allowed: torch.Tensor) -> torch.Tensor:
+        return additive_mask(allowed, self.dtype) if self.cuda else allowed
 
     def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor | None, tail_start: int) -> torch.Tensor:
         B, length = q.shape[0], mask.shape[-1]
@@ -239,8 +240,7 @@ class Engine:
 
     def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hc, hm = h[:, :self.K], h[:, self.K:]
-        # With more than one row both halves are strided. CUDA multiplies a strided input with a batched GEMM that reads the weights once per
-        # row, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
+        # With more than one row both halves are strided: CUDA then runs a batched GEMM that reads the weights once per row, and MPS on torch 2.14 multiplies a strided input by the untransposed candidate weights about 2x slower.
         if self.cuda:
             return hc.contiguous(), hm.contiguous()
         return (hc.contiguous() if self.mps else hc), hm
@@ -324,11 +324,9 @@ class Engine:
         pos = starts[:, None] + torch.arange(T, device=dev)[None]
         wpos = torch.where(valid, pos, self.trash)
         rows = torch.arange(B, device=dev)[:, None].expand(B, T)
-        mask = (self.ar_l[:Lk][None, None, :] <= pos[:, :, None])[:, None]
-        if self.cuda:
-            mask = additive_mask(mask, self.dtype)
+        mask = self.attention_mask((self.ar_l[:Lk][None, None, :] <= pos[:, :, None])[:, None])
         cos, sin = base.model.rotary_emb(pos)
-        keep = valid.float()[..., None]
+        conv_columns = (lens[:, None] + self.ar_conv_kernel[None])[:, None, :]
         x = base.model.embed_tokens(ids)
         for i, layer in enumerate(self.layers):
             h = layer.input_layernorm(x)
@@ -342,10 +340,10 @@ class Engine:
                 q = q.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
                 v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
-                beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i], keep)
+                beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i], valid)
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
-                    torch.gather(ext, 2, (lens[:, None] + self.ar_conv[None])[:, None, :].expand(B, lin.conv_dim, -1), out=self.conv[i][:B])
+                    torch.gather(ext, 2, conv_columns.expand(B, lin.conv_dim, -1), out=self.conv[i][:B])
                 self.dk[i][rows, wpos] = apply_rotary(k, cos, sin)
                 self.dv[i][rows, wpos] = v
                 z = lin.in_proj_z(h).view(B, T, lin.num_v_heads, lin.head_v_dim)
@@ -380,9 +378,7 @@ class Engine:
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
-        mask = torch.cat((allow_cache, self.allow_mm[None].expand(B, -1, -1)), dim=2)[:, None]
-        if self.cuda:
-            mask = additive_mask(mask, self.dtype)
+        mask = self.attention_mask(torch.cat((allow_cache, self.allow_mm[None].expand(B, -1, -1)), dim=2)[:, None])
         x = torch.cat((base.model.embed_tokens(cand), self.mask_embed.view(1, 1, -1).expand(B, M, -1)), dim=1)
         pending = {}
         for i, layer in enumerate(self.layers):
@@ -445,7 +441,7 @@ class Engine:
         jm1 = (j - 1).clamp(min=0)
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
-        conv_columns = (j[:, None] + self.ar_conv[None])[:, None, :]
+        conv_columns = (j[:, None] + self.ar_conv_kernel[None])[:, None, :]
         for i, (k, v, g, beta, ext) in pending.items():
             self.delta_commit(k, v, g, beta, self.rec[i][:B], j)
             torch.gather(ext, 2, conv_columns.expand(B, ext.shape[1], -1), out=self.conv[i][:B])
@@ -535,8 +531,7 @@ class Engine:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
         budget = opts.max_think if opts.think else 0
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
-        # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so one merged pass would move the last prompt token and the no-think tail
-        # of a long prompt from bf16 to fp8 activations.
+        # CUDA's fp8 GEMM quantizes activations above LARGE_M rows, so one merged pass would move the last prompt token and the no-think tail of a long prompt from bf16 to fp8 activations.
         merge_passes = not (self.cuda and self.precision == "fp8")
         P = common_prefix(prompts) if B > 1 or not merge_passes else 0
         self.reset(self.decode_rows(B))

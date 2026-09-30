@@ -4,8 +4,10 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel
 
-from inference.engine import merge_linears_in_place
+from inference.engine import EFFICIENT, MASK_ROW_ALIGNMENT, additive_mask, merge_linears_in_place
 from inference.fp8 import FP8Linear
 
 CUDA = torch.device("cuda")
@@ -40,8 +42,30 @@ def merges() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def masks() -> list[str]:
+    failures = []
+    torch.manual_seed(0)
+    for B, Q, H, Hkv, D, L in ((1, 16, 16, 4, 256, 524), (3, 16, 16, 4, 256, 1040), (2, 12, 32, 32, 128, 524)):
+        q = torch.randn(B, Q, H, D, device=CUDA, dtype=torch.bfloat16)
+        k, v = (torch.randn(B, L, Hkv, D, device=CUDA, dtype=torch.bfloat16) for _ in range(2))
+        allowed = torch.rand(B, 1, Q, L, device=CUDA) < 0.5
+        allowed[..., 0] = True
+        mask = additive_mask(allowed, torch.bfloat16)
+        if mask.stride(-2) % MASK_ROW_ALIGNMENT:
+            failures.append(f"additive_mask for {L} keys has a row stride of {mask.stride(-2)}")
+        outputs = []
+        for m in (allowed, mask):
+            with sdpa_kernel(EFFICIENT):
+                outputs.append(F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=m,
+                                                              enable_gqa=H != Hkv))
+        if not torch.equal(*outputs):
+            failures.append(f"SDPA with additive_mask {(B, Q, H, Hkv, D, L)} is not bitwise equal to SDPA with the boolean mask")
+    return failures
+
+
 def main() -> None:
-    failures = merges()
+    failures = merges() + masks()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 

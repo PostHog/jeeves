@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from fla.ops.utils.op import exp
 from triton.language.extra import libdevice
 
 
@@ -18,7 +17,7 @@ def _round_to_bf16(x):
 # Rounds cos, sin, both products and their sum to bf16, like apply_rotary's eager path on bf16.
 @triton.jit
 def _rotary(x, cos, sin, out, heads, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     token = row // heads
     d = tl.arange(0, BLOCK)
     inside = d < D
@@ -49,88 +48,42 @@ def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
     return out
 
 
-# The state update of fla's fused_recurrent_gated_delta_rule_fwd_kernel, with the same operations in the same order so that it rounds the
-# same, run for the first steps[n] tokens of row n. It updates the state in place and computes no outputs.
+# PyTorch's CUDA sigmoid and softplus use expf, log1pf and IEEE division and keep subnormals. libdevice, div_rn and a launch with enable_reflect_ftz=False do the same; tl.exp and "/" are approximate.
 @triton.jit
-def _gated_delta_rule_advance(k, v, g, beta, state, steps, T, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-                              BK: tl.constexpr, BV: tl.constexpr):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-    o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-    p_k = k + (i_n * T * H + i_h) * K + o_k
-    p_v = v + (i_n * T * HV + i_hv) * V + o_v
-    p_g = g + i_n * T * HV + i_hv
-    p_beta = beta + i_n * T * HV + i_hv
-    p_h = state + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    b_h += tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
-    for _ in tl.range(0, tl.load(steps + i_n)):
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_beta = tl.load(p_beta).to(tl.float32)
-        b_g = tl.load(p_g).to(tl.float32)
-        b_h *= exp(b_g)
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
-        p_k += H * K
-        p_v += HV * V
-        p_g += HV
-        p_beta += HV
-    tl.store(p_h, b_h, mask=mask_h)
-
-
-def gated_delta_rule_advance(k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor,
-                             steps: torch.Tensor) -> None:
-    B, T, H, K = k.shape
-    HV, V = v.shape[2], v.shape[3]
-    if state.dtype != torch.float32 or not state.is_contiguous() or state.shape != (B, HV, K, V):
-        raise ValueError(f"state: expected a contiguous float32 tensor of shape {(B, HV, K, V)}, got {state.dtype} {tuple(state.shape)}")
-    # fla's block sizes, warps and stages, so that the reductions run in the same order.
-    BV = min(8, triton.next_power_of_2(V))
-    _gated_delta_rule_advance[(triton.cdiv(V, BV), B * HV)](k.contiguous(), v.contiguous(), g.contiguous(), beta.contiguous(), state, steps, T,
-                                                           H=H, HV=HV, K=K, V=V, BK=triton.next_power_of_2(K), BV=BV, num_warps=1,
-                                                           num_stages=3)
-
-
-# PyTorch's CUDA sigmoid and softplus use expf, log1pf and IEEE division, which libdevice and div_rn match; tl.exp and "/" are approximate.
-@triton.jit
-def _delta_gates(b, a, dt_bias, log_decay_rate, keep, beta, g, stride_b, stride_a, HV: tl.constexpr, HAS_KEEP: tl.constexpr,
+def _delta_gates(b, a, dt_bias, log_decay_rate, valid, beta, g, stride_b, stride_a, HV: tl.constexpr, HAS_VALID: tl.constexpr,
                  BLOCK: tl.constexpr):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     h = tl.arange(0, BLOCK)
     inside = h < HV
-    b_row = tl.load(b + row * stride_b + h, mask=inside, other=0.0).to(tl.float32)
-    a_row = tl.load(a + row * stride_a + h, mask=inside, other=0.0).to(tl.float32) + tl.load(dt_bias + h, mask=inside, other=0.0).to(tl.float32)
-    sigmoid = _round_to_bf16(tl.math.div_rn(1.0, 1.0 + libdevice.exp(-b_row)))
-    softplus = tl.where(a_row > 20.0, a_row, libdevice.log1p(libdevice.exp(a_row)))
-    decay = tl.load(log_decay_rate + h, mask=inside, other=0.0) * softplus
-    if HAS_KEEP:
-        kept = tl.load(keep + row)
+    b_value = tl.load(b + row * stride_b + h, mask=inside, other=0.0).to(tl.float32)
+    a_value = tl.load(a + row * stride_a + h, mask=inside, other=0.0).to(tl.float32)
+    softplus_input = a_value + tl.load(dt_bias + h, mask=inside, other=0.0).to(tl.float32)
+    sigmoid = _round_to_bf16(tl.math.div_rn(1.0, 1.0 + libdevice.exp(-b_value)))
+    softplus = tl.where(softplus_input > 20.0, softplus_input, libdevice.log1p(libdevice.exp(softplus_input)))
+    log_decay = tl.load(log_decay_rate + h, mask=inside, other=0.0) * softplus
+    if HAS_VALID:
+        kept = tl.load(valid + row).to(tl.float32)
         sigmoid = sigmoid * kept
-        decay = decay * kept
+        log_decay = log_decay * kept
     tl.store(beta + row * HV + h, sigmoid.to(tl.bfloat16), mask=inside)
-    tl.store(g + row * HV + h, decay, mask=inside)
+    tl.store(g + row * HV + h, log_decay, mask=inside)
 
 
 def delta_gates(b: torch.Tensor, a: torch.Tensor, dt_bias: torch.Tensor, log_decay_rate: torch.Tensor,
-                keep: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                valid: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     *lead, HV = b.shape
     if b.dtype != torch.bfloat16 or a.dtype != torch.bfloat16:
         raise ValueError(f"b, a: expected bfloat16, got {b.dtype}, {a.dtype}")
+    if valid is not None and (valid.shape != tuple(lead) or valid.dtype != torch.bool):
+        raise ValueError(f"valid: expected a bool tensor of shape {tuple(lead)}, got {valid.dtype} {tuple(valid.shape)}")
     b2, a2 = b.reshape(-1, HV), a.reshape(-1, HV)
     if b2.stride(-1) != 1 or a2.stride(-1) != 1:
         b2, a2 = b2.contiguous(), a2.contiguous()
     rows = b2.shape[0]
     beta = torch.empty(*lead, HV, dtype=torch.bfloat16, device=b.device)
     g = torch.empty(*lead, HV, dtype=torch.float32, device=b.device)
-    keep_rows = None if keep is None else keep.float().expand(*lead, 1).reshape(rows).contiguous()
+    valid_rows = None if valid is None else valid.reshape(rows).contiguous()
     if rows:
-        _delta_gates[(rows,)](b2, a2, dt_bias, log_decay_rate.float().contiguous(), keep_rows, beta, g, b2.stride(0), a2.stride(0), HV=HV,
-                              HAS_KEEP=keep is not None, BLOCK=triton.next_power_of_2(HV))
+        _delta_gates[(rows,)](b2, a2, dt_bias, log_decay_rate.float().contiguous(), valid_rows, beta, g, b2.stride(0), a2.stride(0), HV=HV,
+                              HAS_VALID=valid is not None, BLOCK=triton.next_power_of_2(HV), enable_reflect_ftz=False)
     return beta, g

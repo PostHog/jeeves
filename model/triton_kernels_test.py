@@ -4,9 +4,10 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, delta_gates, gated_delta_rule_advance, set_kernels
+from model.model import apply_rotary, delta_gates, gated_delta_rule_advance_inplace, set_kernels
 
 CUDA = torch.device("cuda")
+BITS = {torch.float32: torch.int32, torch.bfloat16: torch.int16}
 
 
 def eager_then_triton(fn):
@@ -16,6 +17,13 @@ def eager_then_triton(fn):
     finally:
         set_kernels(triton_inference=True)
     return eager, fn()
+
+
+def same_bits(x: torch.Tensor, y: torch.Tensor) -> bool:
+    if x.dtype != y.dtype or x.shape != y.shape or not torch.equal(x.isnan(), y.isnan()):
+        return False
+    numbers = ~x.isnan()
+    return torch.equal(x.view(BITS[x.dtype])[numbers], y.view(BITS[y.dtype])[numbers])
 
 
 @torch.no_grad()
@@ -28,16 +36,16 @@ def rotary() -> list[str]:
         freqs = positions * torch.logspace(0, -7, 32)
         cos, sin = freqs.cos().to(CUDA), freqs.sin().to(CUDA)
         eager, out = eager_then_triton(lambda: apply_rotary(x, cos, sin))
-        if not torch.equal(out, eager):
+        if not same_bits(out, eager):
             failures.append(f"apply_rotary {(B, T, H, D)} with the Triton kernel is not bitwise equal to eager")
         shared_eager, shared_out = eager_then_triton(lambda: apply_rotary(x, cos[0], sin[0]))
-        if not torch.equal(shared_out, shared_eager):
+        if not same_bits(shared_out, shared_eager):
             failures.append(f"apply_rotary {(B, T, H, D)} with 2-D cos changed with the Triton kernel on")
     x = torch.randn(1, 2, 4, 128, generator=gen).to(torch.bfloat16).to(CUDA)
     x[0, 0, 0, 5] = float("nan")
     freqs = torch.arange(2).float()[None, :, None] * torch.logspace(0, -7, 32)
     eager, out = eager_then_triton(lambda: apply_rotary(x, freqs.cos().to(CUDA), freqs.sin().to(CUDA)))
-    if not torch.equal(out.isnan(), eager.isnan()):
+    if not same_bits(out, eager):
         failures.append("apply_rotary with the Triton kernel does not propagate NaN like eager")
     return failures
 
@@ -46,23 +54,23 @@ def rotary() -> list[str]:
 def delta_advance() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(5)
-    for B, T, H, HV, D in ((4, 4, 32, 32, 128), (2, 4, 16, 32, 128), (3, 1, 32, 32, 128)):
+    for B, T, H, HV, D in ((4, 4, 32, 32, 128), (2, 4, 16, 32, 128), (3, 1, 32, 32, 128), (4, 8, 32, 32, 128)):
         k = torch.randn(B, T, H, D, generator=gen).to(torch.bfloat16).to(CUDA)
         v = torch.randn(B, T, HV, D, generator=gen).to(torch.bfloat16).to(CUDA)
         g = -torch.rand(B, T, HV, generator=gen).to(CUDA)
         beta = torch.rand(B, T, HV, generator=gen).to(torch.bfloat16).to(CUDA)
         state = torch.randn(B, HV, D, D, generator=gen).to(CUDA)
-        steps = torch.arange(B).remainder(T + 1).to(CUDA)
-
-        def advanced() -> torch.Tensor:
-            advanced_state = state.clone()
-            gated_delta_rule_advance(k, v, g, beta, advanced_state, steps)
-            return advanced_state
-        eager, out = eager_then_triton(advanced)
-        if not torch.equal(out, eager):
-            failures.append(f"gated_delta_rule_advance {(B, T, H, HV, D)} with the Triton kernel is not bitwise equal to fla's masked steps")
-        if not torch.equal(out[steps == 0], state[steps == 0]):
-            failures.append(f"gated_delta_rule_advance {(B, T, H, HV, D)} changed a row that advances 0 steps")
+        for steps in (torch.tensor([T, 0, 1, T - 1])[:B].to(CUDA), torch.tensor([-5, T + 9, 0, T])[:B].to(CUDA)):
+            def advanced() -> torch.Tensor:
+                advanced_state = state.clone()
+                gated_delta_rule_advance_inplace(k, v, g, beta, advanced_state, steps)
+                return advanced_state
+            eager, out = eager_then_triton(advanced)
+            if not same_bits(out, eager):
+                failures.append(f"gated_delta_rule_advance_inplace {(B, T, H, HV, D)} with steps {steps.tolist()} and the Triton kernel is "
+                                f"not bitwise equal to fla's masked steps")
+            if not same_bits(out[steps <= 0], state[steps <= 0]):
+                failures.append(f"gated_delta_rule_advance_inplace {(B, T, H, HV, D)} changed a row that advances 0 steps")
     return failures
 
 
@@ -73,19 +81,29 @@ def gates() -> list[str]:
     HV = 32
     merged = (torch.randn(3, 5, 64 + 2 * HV, generator=gen) * 12).to(torch.bfloat16).to(CUDA)
     b, a = merged[..., 64:64 + HV], merged[..., 64 + HV:]
+    # Softplus of about -103 to -87 is subnormal, where a flush to zero would differ from PyTorch.
+    a[0, 0] = torch.linspace(-110, -80, HV)
+    b[0, 0] = torch.linspace(-100, 100, HV)
+    a[0, 1, :4] = torch.tensor([float("inf"), float("-inf"), 30.0, -30.0])
+    b[0, 1, :2] = torch.tensor([float("inf"), float("-inf")])
+    a[1, 0, 0] = b[1, 0, 1] = float("nan")
     rate = -torch.rand(HV, generator=gen).exp().to(CUDA)
-    keep = (torch.rand(3, 5, 1, generator=gen) < 0.7).float().to(CUDA)
+    valid = (torch.rand(3, 5, generator=gen) < 0.7).to(CUDA)
     for dt_bias in (torch.randn(HV, generator=gen).to(CUDA), torch.randn(HV, generator=gen).to(torch.bfloat16).to(CUDA)):
-        for kept in (None, keep):
-            eager, out = eager_then_triton(lambda: delta_gates(b, a, dt_bias, rate, kept))
+        for rows_valid in (None, valid):
+            eager, out = eager_then_triton(lambda: delta_gates(b, a, dt_bias, rate, rows_valid))
             for name, x, y in zip(("beta", "g"), out, eager):
-                if x.dtype != y.dtype or not torch.equal(x, y):
-                    failures.append(f"delta_gates {name} (dt_bias {dt_bias.dtype}, keep {kept is not None}) with the Triton kernel is not "
-                                    f"bitwise equal to eager")
+                if not same_bits(x, y):
+                    failures.append(f"delta_gates {name} (dt_bias {dt_bias.dtype}, valid {rows_valid is not None}) with the Triton kernel is "
+                                    f"not bitwise equal to eager")
     return failures
 
 
 def main() -> None:
+    enabled = set_kernels(triton_inference=True, gdn=True)
+    if not (enabled["triton_inference"] and enabled["gdn"]):
+        print(f"the Triton and fla kernels are not available, so nothing can be checked: {enabled}")
+        sys.exit(1)
     failures = rotary() + delta_advance() + gates()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
