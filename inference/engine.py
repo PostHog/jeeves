@@ -409,14 +409,14 @@ class Engine:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
         budget = opts.max_think if opts.think else 0
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for p, r in zip(prompts, rems)]
-        P = common_prefix(prompts) if B > 1 or not self.mps else 0
+        P = common_prefix(prompts) if B > 1 else 0
         self.reset(self.decode_rows(B))
         if P > 0:
             self.extend([prompts[0][:P]], [0], commit=True)
             self.broadcast(B, P)
         tails = [self.empty_think + r for r in rems]
         first = nothink = None
-        if self.mps and not any(caps):
+        if not any(caps):
             hn = self.extend([p[P:] + t for p, t in zip(prompts, tails)], [P] * B, commit=False)
             nothink = [self.readout(hn[b, len(p) - P:], t) for b, (p, t) in enumerate(zip(prompts, tails))]
         else:
