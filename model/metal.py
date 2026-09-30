@@ -583,7 +583,134 @@ def multi_query_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch
     return out
 
 
-SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _GATED_RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION
+# FP8 linear (w8a16): y = x @ (codes * scale).T with float accumulation and one rounding to bf16, the math of inference/fp8.py's
+# w8a16 kernel. A simdgroup owns FP8_TILE_FEATURES output features and FP8_TILE_ROWS rows of x.
+
+FP8_TILE_FEATURES = 16
+FP8_TILE_ROWS = 8
+FP8_BLOCK_K = 64
+FP8_SIMDGROUPS = 4
+FP8_K_SPLITS = 4
+
+_FP8_LINEAR = f"""
+constant constexpr uint FP8_TILE_FEATURES = {FP8_TILE_FEATURES}, FP8_BLOCK_K = {FP8_BLOCK_K};
+""" + r"""
+// Four e4m3fn codes as their values times 2^-8: the sign moves to fp16 bit 15 and the exponent and mantissa to bits 13..7, which
+// is exact for every code, subnormals included. even gets bytes 0 and 2 of word, odd gets bytes 1 and 3.
+inline void fp8x4_times_2_pow_minus_8(uint word, thread float2& even, thread float2& odd) {
+    even = float2(as_type<half2>(((word & 0x00800080u) << 8) | ((word & 0x007F007Fu) << 7)));
+    odd = float2(as_type<half2>((word & 0x80008000u) | ((word & 0x7F007F00u) >> 1)));
+}
+
+// Each lane loads 16 contiguous code bytes of one feature per 64-k block and uses bytes 2q and 2q + 1 as its fragment of k tile q.
+// The x fragments follow the same permutation of k within the block, so the dot products are unchanged.
+template <bool PARTIAL>
+inline void fp8_linear_tile(device const bfloat* x, device const uchar* w, device const float* scale, device void* y,
+                            uint M, uint N, uint K, uint k_per_part, uint3 tg, uint sg, uint sgs, uint lane) {
+    const uint n0 = (tg.x * sgs + sg) * FP8_TILE_FEATURES;
+    if (n0 >= N) return;
+    const uint m0 = tg.z * 8, part = tg.y;
+    const uint quad = lane / 4;
+    const uint frag_row = (quad & 4) + ((lane / 2) % 4);
+    const uint frag_col = (quad & 2) * 2 + (lane % 2) * 2;
+    const uint x_offset = 8 * (frag_row & ~1u) + (frag_row & 1u);
+    device const bfloat* x0 = x + ulong(min(m0 + frag_col, M - 1)) * K + x_offset;
+    device const bfloat* x1 = x + ulong(min(m0 + frag_col + 1, M - 1)) * K + x_offset;
+    device const uchar* w0 = w + ulong(n0 + frag_row) * K + 8 * frag_col;
+    device const uchar* w1 = w0 + 8 * ulong(K);
+    simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f), acc1 = simdgroup_float8x8(0.0f);
+    for (uint k0 = part * k_per_part; k0 < (part + 1) * k_per_part; k0 += FP8_BLOCK_K) {
+        const uint4 codes0 = *(device const uint4*)(w0 + k0);
+        const uint4 codes1 = *(device const uint4*)(w1 + k0);
+        for (uint p = 0; p < 4; ++p) {
+            float2 even0, odd0, even1, odd1;
+            fp8x4_times_2_pow_minus_8(codes0[p], even0, odd0);
+            fp8x4_times_2_pow_minus_8(codes1[p], even1, odd1);
+            for (uint h = 0; h < 2; ++h) {
+                const uint k = k0 + 4 * p + 2 * h;
+                simdgroup_float8x8 b, a0, a1;
+                b.thread_elements()[0] = float(x0[k]);
+                b.thread_elements()[1] = float(x1[k]);
+                a0.thread_elements()[0] = h ? even0.y : even0.x;
+                a0.thread_elements()[1] = h ? odd0.y : odd0.x;
+                a1.thread_elements()[0] = h ? even1.y : even1.x;
+                a1.thread_elements()[1] = h ? odd1.y : odd1.x;
+                simdgroup_multiply_accumulate(acc0, a0, b, acc0);
+                simdgroup_multiply_accumulate(acc1, a1, b, acc1);
+            }
+        }
+    }
+    for (uint t = 0; t < 2; ++t) {
+        const uint n = n0 + 8 * t + frag_row;
+        for (uint e = 0; e < 2; ++e) {
+            const uint m = m0 + frag_col + e;
+            if (m >= M) continue;
+            const float v = t ? acc1.thread_elements()[e] : acc0.thread_elements()[e];
+            if (PARTIAL)
+                ((device float*)y)[(ulong(part) * M + m) * N + n] = v;
+            else
+                ((device bfloat*)y)[ulong(m) * N + n] = bfloat(v * (scale[n] * 256.0f));
+        }
+    }
+}
+
+kernel void fp8_linear(device const bfloat* x [[buffer(0)]], device const uchar* w [[buffer(1)]], device const float* scale [[buffer(2)]],
+                       device bfloat* y [[buffer(3)]], constant long& M [[buffer(4)]], constant long& N [[buffer(5)]],
+                       constant long& K [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint sgs [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    fp8_linear_tile<false>(x, w, scale, y, uint(M), uint(N), uint(K), uint(K), tg, sg, sgs, lane);
+}
+
+kernel void fp8_linear_partial(device const bfloat* x [[buffer(0)]], device const uchar* w [[buffer(1)]], device const float* scale [[buffer(2)]],
+                               device float* parts [[buffer(3)]], constant long& M [[buffer(4)]], constant long& N [[buffer(5)]],
+                               constant long& K [[buffer(6)]], constant long& k_per_part [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]],
+                               uint sg [[simdgroup_index_in_threadgroup]], uint sgs [[simdgroups_per_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    fp8_linear_tile<true>(x, w, scale, parts, uint(M), uint(N), uint(K), uint(k_per_part), tg, sg, sgs, lane);
+}
+
+kernel void fp8_linear_merge(device const float* parts [[buffer(0)]], device const float* scale [[buffer(1)]], device bfloat* y [[buffer(2)]],
+                             constant long& MN [[buffer(3)]], constant long& N [[buffer(4)]], constant long& splits [[buffer(5)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= uint(MN)) return;
+    float acc = 0.0f;
+    for (uint p = 0; p < uint(splits); ++p)
+        acc += parts[ulong(p) * ulong(MN) + i];
+    y[i] = bfloat(acc * (scale[i % uint(N)] * 256.0f));
+}
+"""
+
+
+def fp8_linear(x: torch.Tensor, codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    N, K = codes.shape
+    _require("x", x, torch.bfloat16)
+    _require("codes", codes, torch.uint8, (N, K))
+    _require("scale", scale, torch.float32, (N,))
+    if x.shape[-1] != K or K % (FP8_BLOCK_K * FP8_K_SPLITS) or N % FP8_TILE_FEATURES or not codes.is_contiguous() or codes.storage_offset() % 16:
+        raise ValueError(f"fp8_linear: needs x (..., {K}), K a multiple of {FP8_BLOCK_K * FP8_K_SPLITS}, N a multiple of {FP8_TILE_FEATURES} "
+                         f"and 16-byte aligned contiguous codes; got x {tuple(x.shape)}, codes {tuple(codes.shape)}")
+    x2 = x.reshape(-1, K).contiguous()
+    M = x2.shape[0]
+    out = torch.empty(*x.shape[:-1], N, dtype=torch.bfloat16, device=x.device)
+    if M == 0:
+        return out
+    row_tiles = -(-M // FP8_TILE_ROWS)
+    groups = -(-N // (FP8_TILE_FEATURES * FP8_SIMDGROUPS))
+    simdgroups = row_tiles * N // FP8_TILE_FEATURES
+    # Measured on an M4 Pro: splitting k pays off once there are too few simdgroups to keep the GPU busy through the whole k loop.
+    splits = FP8_K_SPLITS if simdgroups <= K // 8 else 1
+    grid = {"threads": (groups * FP8_SIMDGROUPS * SIMD, splits, row_tiles), "group_size": (FP8_SIMDGROUPS * SIMD, 1, 1)}
+    scale = scale.contiguous()
+    if splits == 1:
+        library().fp8_linear(x2, codes, scale, out, M, N, K, **grid)
+        return out
+    parts = torch.empty(splits, M, N, dtype=torch.float32, device=x.device)
+    library().fp8_linear_partial(x2, codes, scale, parts, M, N, K, K // splits, **grid)
+    library().fp8_linear_merge(parts, scale, out, M * N, N, splits, threads=(M * N, 1, 1), group_size=(256, 1, 1))
+    return out
+
+
+SOURCE = _HEADER + _GATED_DELTA_RULE + _RMS_NORM + _GATED_RMS_NORM + _ROTARY + _CACHED_ATTENTION + _MULTI_QUERY_ATTENTION + _FP8_LINEAR
 _library = None
 
 

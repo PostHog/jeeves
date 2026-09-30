@@ -196,8 +196,42 @@ def attention() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def fp8() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(6)
+    codes = torch.arange(256, dtype=torch.uint8)
+    finite = codes[~codes.view(torch.float8_e4m3fn).float().isnan()]
+    lookup = finite[(torch.arange(256)[:, None] + torch.arange(256)[None]) % len(finite)]
+    picked = metal.fp8_linear(torch.eye(256, dtype=torch.bfloat16, device=MPS), lookup.to(MPS), torch.ones(256, device=MPS)).cpu()
+    if not torch.equal(picked.float(), lookup.view(torch.float8_e4m3fn).float().t()):
+        failures.append("fp8_linear does not decode every finite e4m3fn code exactly")
+    for shape, K, N in (((1,), 256, 16), ((3,), 4096, 1024), ((12,), 4096, 4096), ((2, 8), 12288, 4096), ((37,), 4096, 8192), ((300,), 1024, 2048)):
+        w = torch.randn(N, K, generator=gen) * 0.02
+        scale = w.abs().amax(1) / torch.finfo(torch.float8_e4m3fn).max
+        w8 = (w / scale[:, None]).to(torch.float8_e4m3fn)
+        x = torch.randn(*shape, K, generator=gen).to(torch.bfloat16)
+        master_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
+        out = metal.fp8_linear(x.to(MPS), w8.view(torch.uint8).to(MPS), scale.to(MPS)).cpu()
+        weights = w8.double() * scale.double()[:, None]
+        exact, magnitude = x.double() @ weights.t(), x.double().abs() @ weights.abs().t()
+        equal = (out == master_math).float().mean().item()
+        print(f"fp8_linear x {tuple(x.shape)} K={K} N={N}: bitwise equal to the w8a16 math of inference/fp8.py {equal:.5f}")
+        # Half a bf16 rounding plus room for float accumulation, which dominates only where the terms cancel.
+        if equal < 0.999 or ((out.double() - exact).abs() > exact.abs() * 2 ** -8 + magnitude * 2 ** -20).any():
+            failures.append(f"fp8_linear x {tuple(x.shape)} K={K} N={N} is further from float64 than one bf16 rounding and float accumulation")
+    for K, N in ((4096 + 64, 1024), (4096, 1024 + 8)):
+        try:
+            metal.fp8_linear(torch.zeros(4, K, dtype=torch.bfloat16, device=MPS), torch.zeros(N, K, dtype=torch.uint8, device=MPS),
+                             torch.ones(N, device=MPS))
+            failures.append(f"fp8_linear accepted K={K} N={N}")
+        except ValueError:
+            pass
+    return failures
+
+
 def main() -> None:
-    failures = exactness() + norms() + gated_norm() + rotary() + attention()
+    failures = exactness() + norms() + gated_norm() + rotary() + attention() + fp8()
     for B, T in ((1, 4), (3, 160), (1, 2048)):
         failures += accuracy(B, T)
     print("\n".join(failures) if failures else "all checks passed")

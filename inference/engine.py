@@ -46,8 +46,8 @@ class Engine:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
         self.precision = precision
         fp8 = precision == "fp8"
-        if fp8 and not (dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)):
-            raise ValueError("fp8 needs a CUDA GPU with compute capability 8.9 or higher")
+        if fp8 and not (self.metal if self.mps else dev.type == "cuda" and torch.cuda.get_device_capability(dev) >= (8, 9)):
+            raise ValueError("fp8 needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels on")
         base, head, encoder = load_export(model, device=dev)
         view = DrafterView(base, block=block).to(dev)
         loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
@@ -56,14 +56,17 @@ class Engine:
             raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
         view.requires_grad_(False)
         self.dtype = base.lm_head.weight.dtype
-        if fp8:
+        if fp8 and self.mps:
+            from inference.fp8_metal import quantize
+            quantize(view)
+        elif fp8:
             from inference.fp8 import quantize, warm
             quantize(view)
             warm(view)
         else:
             for proj in view.projections():
                 proj.to(self.dtype)
-        if self.mps and torch.backends.mps.is_macos_or_newer(15, 0):
+        if self.mps and not fp8 and torch.backends.mps.is_macos_or_newer(15, 0):
             # On torch 2.14, MPS computes x @ W.T faster, and bitwise equal, with W.T contiguous once x has 10 or more rows, but slower with fewer; so only projections fed the K + M cycle rows switch, except attn_k/attn_v, which are slower even at M rows.
             for layer in base.model.layers:
                 mixer = (layer.linear_attn.in_proj_z, layer.linear_attn.out_proj) if layer.layer_type == LINEAR else (layer.self_attn.o_proj,)
@@ -162,7 +165,7 @@ class Engine:
         return (hc.contiguous() if self.mps else hc), hm
 
     def vocab_logits(self, h: torch.Tensor) -> torch.Tensor:
-        if not self.mps:
+        if not self.mps or self.precision == "fp8":
             return self.base.lm_head(h)
         # MPS in torch 2.14 picks a slow kernel for the 248k-row matmul; row chunks of the weight give bitwise-equal logits much faster.
         return torch.cat([F.linear(h, w) for w in self.base.lm_head.weight.chunk(8)], dim=-1)
