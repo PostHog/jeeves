@@ -50,8 +50,12 @@ class Question:
             raise ValueError(f"{self.id}: choice criteria must be a dict")
         if self.type == SCORE and not isinstance(self.criteria, list):
             raise ValueError(f"{self.id}: score criteria must be a list")
-        if self.type == NOUL and self.criteria is not None and not isinstance(self.criteria, dict):
-            raise ValueError(f"{self.id}: noul criteria must be a dict or null")
+        if self.type == NOUL and self.criteria is not None:
+            if not isinstance(self.criteria, dict):
+                raise ValueError(f"{self.id}: noul criteria must be a dict or null")
+            unknown = set(self.criteria) - {"true", "false"}
+            if unknown:
+                raise ValueError(f"{self.id}: noul criteria may only describe true and false, got {sorted(unknown)}")
 
     def keys(self) -> list[str]:
         if self.type == CHOICE:
