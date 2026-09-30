@@ -102,10 +102,12 @@ def main() -> None:
     ap.add_argument("--save", default=None)
     ap.add_argument("--reference", default=None)
     ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
+    ap.add_argument("--drafter", default="drafter_k4.safetensors", help="drafter file in the model snapshot")
+    ap.add_argument("--block", type=int, default=4, help="the drafter's block size")
     a = ap.parse_args()
     model = a.model or default_snapshot()
     records = read_jsonl(a.data)
-    engine = Engine(model, f"{model}/drafter_k4.safetensors", precision=a.precision, max_rows=MAX_ROWS, max_len=MAX_LEN)
+    engine = Engine(model, f"{model}/{a.drafter}", block=a.block, precision=a.precision, max_rows=MAX_ROWS, max_len=MAX_LEN)
     engine.answer(records[0], Options(max_think=16))
     if a.eval:
         summary, outputs = evaluate(engine, records, a.eval)
