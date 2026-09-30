@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from . import metal
@@ -317,6 +318,16 @@ def delta_gates(b, a, dt_bias, log_decay_rate, valid=None) -> tuple[torch.Tensor
         return beta, g
     kept = valid[..., None]
     return beta * kept.to(beta.dtype), g * kept.float()
+
+
+def decode_attention(q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
+    B, length, gqa = q.shape[0], mask.shape[-1], q.shape[2] != k_cache.shape[2]
+    if _on_triton_inference(q, k_cache, v_cache) and mask.dtype == q.dtype and q.shape[1] * (q.shape[2] // k_cache.shape[2]) <= 64:
+        return triton_kernels.decode_attention(q, k_cache, v_cache, mask, scale)
+    keys, vals = k_cache[:B, :length], v_cache[:B, :length]
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
+                                              enable_gqa=gqa).transpose(1, 2)
 
 
 class Cache:

@@ -4,7 +4,7 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, delta_gates, gated_delta_rule_advance_inplace, set_kernels
+from model.model import apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace, set_kernels
 
 CUDA = torch.device("cuda")
 BITS = {torch.float32: torch.int32, torch.bfloat16: torch.int16}
@@ -99,12 +99,36 @@ def gates() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def attention() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(7)
+    candidates, mask_rows = 4, 12
+    for B, skip, H, Hkv, D, Lw in ((1, 0, 16, 4, 256, 512), (3, 0, 16, 4, 256, 1024), (2, 4, 32, 32, 128, 2048), (4, 4, 32, 32, 128, 512)):
+        L, R = Lw + mask_rows, candidates + mask_rows - skip
+        q = torch.randn(B, R, H, D, generator=gen).to(torch.bfloat16).to(CUDA)
+        k_cache, v_cache = (torch.randn(8, L + 1, Hkv, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2))
+        allowed = torch.rand(B, 1, R, L, generator=gen) < 0.5
+        allowed[..., 0] = True
+        for mask in (torch.zeros(B, 1, R, L + 4)[..., :L], torch.zeros(B, 1, R, L)):
+            mask = mask.masked_fill(~allowed, float("-inf")).to(torch.bfloat16).to(CUDA)
+            eager, out = eager_then_triton(lambda: decode_attention(q, k_cache, v_cache, mask, D ** -0.5))
+            keys, values = (t[:B, :L].float().repeat_interleave(H // Hkv, dim=2) for t in (k_cache, v_cache))
+            scores = torch.einsum("brhd,blhd->bhrl", q.float(), keys) * D ** -0.5 + mask.float()
+            reference = torch.einsum("bhrl,blhd->brhd", scores.softmax(-1), values)
+            error, eager_error = (out.float() - reference).abs(), (eager.float() - reference).abs()
+            if out.isnan().any() or error.mean() > 1.25 * eager_error.mean() or error.max() > 2 * eager_error.max():
+                failures.append(f"decode_attention {(B, R, H, Hkv, D, L)}: the Triton kernel's error against float32 (mean {error.mean():.2e}, "
+                                f"max {error.max():.2e}) is above SDPA's (mean {eager_error.mean():.2e}, max {eager_error.max():.2e})")
+    return failures
+
+
 def main() -> None:
     enabled = set_kernels(triton_inference=True, gdn=True)
     if not (enabled["triton_inference"] and enabled["gdn"]):
         print(f"the Triton and fla kernels are not available, so nothing can be checked: {enabled}")
         sys.exit(1)
-    failures = rotary() + delta_advance() + gates()
+    failures = rotary() + delta_advance() + gates() + attention()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 

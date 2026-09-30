@@ -12,8 +12,8 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, delta_gates, gated_delta_rule_advance_inplace, gated_delta_rule_chunk,
-                         gated_delta_rule_step, metal_enabled)
+from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace,
+                         gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -212,17 +212,13 @@ class Engine:
         return additive_mask(allowed, self.dtype) if self.cuda else allowed
 
     def cached_attention(self, q, k_cache, v_cache, mask, scale: float, used_end: torch.Tensor | None, tail_start: int) -> torch.Tensor:
-        B, length = q.shape[0], mask.shape[-1]
-        gqa = q.shape[2] != k_cache.shape[2]
+        B, gqa = q.shape[0], q.shape[2] != k_cache.shape[2]
         if self.metal:
             # Tuned on an M4 Pro with torch 2.14: the chunked kernel wins from 2 rows for the delta layers' mask queries, and from 4 rows for attention.
             if B >= (4 if gqa else 2):
                 return metal.chunked_cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
             return metal.cached_attention(q, k_cache, v_cache, mask[:, 0], scale, used_end, tail_start)
-        keys, vals = k_cache[:B, :length], v_cache[:B, :length]
-        with sdpa_kernel(EFFICIENT):
-            return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
-                                                  enable_gqa=gqa).transpose(1, 2)
+        return decode_attention(q, k_cache, v_cache, mask, scale)
 
     def project(self, x: torch.Tensor, *linears: nn.Module) -> tuple[torch.Tensor, ...]:
         if not self.merged_projections:
