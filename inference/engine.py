@@ -52,6 +52,13 @@ def freeze_rms_norms(module: nn.Module) -> None:
             freeze_rms_norms(child)
 
 
+def additive_mask(allowed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # SDPA converts a boolean mask to an additive one in every call, and pads a mask whose row stride is not aligned, so both are done once here.
+    padded = -(-allowed.shape[-1] // 16) * 16
+    mask = torch.full((*allowed.shape[:-1], padded), float("-inf"), dtype=dtype, device=allowed.device)[..., :allowed.shape[-1]]
+    return mask.masked_fill_(allowed, 0.0)
+
+
 def common_prefix(seqs: list[list[int]]) -> int:
     n = min(len(s) for s in seqs) - 1
     for i in range(n):
@@ -316,6 +323,8 @@ class Engine:
         wpos = torch.where(valid, pos, self.trash)
         rows = torch.arange(B, device=dev)[:, None].expand(B, T)
         mask = (self.ar_l[:Lk][None, None, :] <= pos[:, :, None])[:, None]
+        if self.cuda:
+            mask = additive_mask(mask, self.dtype)
         cos, sin = base.model.rotary_emb(pos)
         keep = valid.float()[..., None]
         x = base.model.embed_tokens(ids)
@@ -372,6 +381,8 @@ class Engine:
         limit = n[:, None] + self.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
         mask = torch.cat((allow_cache, self.allow_mm[None].expand(B, -1, -1)), dim=2)[:, None]
+        if self.cuda:
+            mask = additive_mask(mask, self.dtype)
         x = torch.cat((base.model.embed_tokens(cand), self.mask_embed.view(1, 1, -1).expand(B, M, -1)), dim=1)
         pending = {}
         for i, layer in enumerate(self.layers):
