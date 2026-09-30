@@ -28,6 +28,10 @@ try:
 except ImportError:
     triton = _fla_recurrent_kernel = None
 try:
+    from . import triton_kernels
+except ImportError:
+    triton_kernels = None
+try:
     from fla.modules.layernorm import rms_norm as _fla_rms_norm
 except ImportError:
     _fla_rms_norm = None
@@ -67,6 +71,7 @@ _AVAILABLE = {
     "causal_conv1d": _fla_causal_conv1d is not None and _fla_causal_conv1d_update is not None,
     "flash_attn": _flash_attn_func is not None,
     "metal": torch.backends.mps.is_available(),
+    "triton_inference": triton_kernels is not None,
 }
 _ENABLED_BY_ENV = os.environ.get("QWEN35_KERNELS", "1") not in ("0", "false", "False")
 KERNELS = {k: v and _ENABLED_BY_ENV for k, v in _AVAILABLE.items()}
@@ -160,6 +165,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     if x.dim() == 4 and _on_metal(x) and not _needs_grad(cos, sin):
         return metal.rotary(x, cos, sin)
+    if x.dim() == 4 and _on("triton_inference", x) and x.dtype == torch.bfloat16 and not _needs_grad(x, cos, sin):
+        return triton_kernels.rotary(x, cos, sin)
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     if cos.dim() == 2 and _on("rotary", x):
         return _fla_rotary(x, cos, sin, interleaved=False)
