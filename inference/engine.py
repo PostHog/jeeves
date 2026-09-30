@@ -17,6 +17,7 @@ from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
+EXTEND_LENGTHS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
@@ -122,6 +123,11 @@ class Engine:
         self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
+        self.extend_graphs: dict[tuple[int, int, int, bool], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self.extend_ids = torch.full((max_rows, max_len), self.pad, dtype=torch.long, device=dev)
+        self.extend_valid = torch.zeros(max_rows, max_len, dtype=torch.bool, device=dev)
+        self.extend_lens = torch.zeros(max_rows, dtype=torch.long, device=dev)
+        self.extend_starts = torch.zeros(max_rows, dtype=torch.long, device=dev)
 
     @property
     def metal(self) -> bool:
@@ -181,19 +187,57 @@ class Engine:
 
     @torch.no_grad()
     def extend(self, seqs: list[list[int]], starts: list[int], commit: bool) -> torch.Tensor:
-        dev, base = self.device, self.base
         B, T = len(seqs), max(len(s) for s in seqs)
-        ids = torch.full((B, T), self.pad, dtype=torch.long)
-        valid = torch.zeros(B, T, dtype=torch.bool)
+        Lk = max(st + len(s) for st, s in zip(starts, seqs))
+        graphed = self.device.type == "cuda"
+        # A pass is thousands of small launches, so CUDA replays a graph captured for its length rounded up; trailing padding changes no valid row.
+        padded = min(next((n for n in EXTEND_LENGTHS if n >= T), T), self.L) if graphed else T
+        ids = torch.full((B, padded), self.pad, dtype=torch.long)
+        valid = torch.zeros(B, padded, dtype=torch.bool)
         for b, s in enumerate(seqs):
             ids[b, :len(s)] = torch.tensor(s, dtype=torch.long)
             valid[b, :len(s)] = True
-        ids, valid = ids.to(dev, non_blocking=True), valid.to(dev, non_blocking=True)
-        lens = torch.tensor([len(s) for s in seqs], device=dev)
-        pos = torch.tensor(starts, device=dev)[:, None] + torch.arange(T, device=dev)[None]
+        lens, first = torch.tensor([len(s) for s in seqs]), torch.tensor(starts)
+        if not graphed:
+            dev = self.device
+            return self.extend_layers(ids.to(dev), valid.to(dev), lens.to(dev), first.to(dev), Lk, commit)
+        keys = padded if max(starts) == 0 else min(-(-Lk // self.window_step) * self.window_step, self.L)
+        self.extend_ids[:B, :padded].copy_(ids)
+        self.extend_valid[:B, :padded].copy_(valid)
+        self.extend_lens[:B].copy_(lens)
+        self.extend_starts[:B].copy_(first)
+        graph, out = self.extend_graph(B, padded, keys, commit)
+        graph.replay()
+        return out[:, :T]
+
+    def extend_graph(self, B: int, T: int, Lk: int, commit: bool) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+        cached = self.extend_graphs.get((B, T, Lk, commit))
+        if cached is not None:
+            return cached
+        inputs = (self.extend_ids[:B, :T], self.extend_valid[:B, :T], self.extend_lens[:B], self.extend_starts[:B], Lk, commit)
+        # The warm-up passes advance the recurrent state, which the caller's own replay must start from.
+        states = [t[:B] for d in (self.conv, self.rec) for t in d.values()]
+        saved = [t.clone() for t in states]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.extend_layers(*inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool):
+            out = self.extend_layers(*inputs)
+        for t, s in zip(states, saved):
+            t.copy_(s)
+        self.extend_graphs[(B, T, Lk, commit)] = graph, out
+        return graph, out
+
+    def extend_layers(self, ids: torch.Tensor, valid: torch.Tensor, lens: torch.Tensor, starts: torch.Tensor, Lk: int, commit: bool) -> torch.Tensor:
+        dev, base = self.device, self.base
+        B, T = ids.shape
+        pos = starts[:, None] + torch.arange(T, device=dev)[None]
         wpos = torch.where(valid, pos, self.trash)
         rows = torch.arange(B, device=dev)[:, None].expand(B, T)
-        Lk = max(st + len(s) for st, s in zip(starts, seqs))
         mask = (self.ar_l[:Lk][None, None, :] <= pos[:, :, None])[:, None]
         cos, sin = base.model.rotary_emb(pos)
         keep = valid.float()[..., None]
