@@ -321,16 +321,22 @@ def delta_gates(b, a, dt_bias, log_decay_rate, valid=None) -> tuple[torch.Tensor
     return beta * kept.to(beta.dtype), g * kept.float()
 
 
-def conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, rep: int, ext_out=None):
-    if _on_triton_inference(qkv, state, weight):
-        return triton_kernels.conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, rep, ext_out)
+def eager_conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, ext_out=None):
     B, T, C = qkv.shape
     ext = torch.cat((state, qkv.transpose(1, 2)), dim=-1, out=ext_out)
     conv = F.silu(F.conv1d(ext, weight, groups=C)[..., -T:]).transpose(1, 2)
     q, k, v = conv.split([key_dim, key_dim, value_dim], dim=-1)
-    q = q.reshape(B, T, key_dim // head_k_dim, head_k_dim).repeat_interleave(rep, dim=2)
-    k = k.reshape(B, T, key_dim // head_k_dim, head_k_dim).repeat_interleave(rep, dim=2)
-    return ext, q, k, v.reshape(B, T, value_dim // head_v_dim, head_v_dim).contiguous()
+    k_heads, v_heads = key_dim // head_k_dim, value_dim // head_v_dim
+    q = q.reshape(B, T, k_heads, head_k_dim).repeat_interleave(v_heads // k_heads, dim=2)
+    k = k.reshape(B, T, k_heads, head_k_dim).repeat_interleave(v_heads // k_heads, dim=2)
+    return ext, q, k, v.reshape(B, T, v_heads, head_v_dim)
+
+
+def conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, ext_out=None):
+    if _on_triton_inference(qkv, state, weight):
+        return triton_kernels.conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, ext_out)
+    ext, q, k, v = eager_conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, ext_out)
+    return ext, q, k, v.contiguous()
 
 
 def rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail_start: int) -> torch.Tensor:

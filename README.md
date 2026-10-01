@@ -88,7 +88,7 @@ hf download PostHog/jeeves-fp8 --local-dir jeeves-fp8
 python -m inference.serve --model jeeves-fp8 --drafter jeeves-fp8/drafter_k4.safetensors --precision fp8 --max-rows 4 --max-len 4096 --port 8009
 ```
 
-`python -m model.metal_test` checks the Metal kernels against float64 and eager references. On CUDA, `python -m model.triton_kernels_test` checks the Triton rotary, delta-state advance, delta gates and cache writes bit for bit against the eager and fla paths, and the decode attention against float32. `python -m inference.cuda_test` checks the merged projections, the attention masks and the FP8 GEMM. `python -m inference.engine_test` checks how `answer_batch` packs requests into groups, on any device. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
+`python -m model.metal_test` checks the Metal kernels against float64 and eager references. On CUDA, `python -m model.triton_kernels_test` checks the Triton rotary, delta-state advance, delta gates, conv step and cache writes bit for bit against the eager and fla paths, and the decode attention against float32. `python -m inference.cuda_test` checks the merged projections, the attention masks and the FP8 GEMM. `python -m inference.engine_test` checks how `answer_batch` packs requests into groups, on any device. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
 
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 
@@ -271,7 +271,7 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 
 | path                                     | contents                                                                            |
 | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| `model/`                                 | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head, Metal kernels       |
+| `model/`                                 | Qwen3.5 (Gated DeltaNet + gated attention), LoRA, pointer head, GPU kernels         |
 | `loader/`                                | prompt format, tokenisation and batching                                            |
 | `prep/`                                  | dataset construction (`prep.py`) and synthetic generators                           |
 | `trainer.py`, `train.py`                 | SFT, CISPO and drafter training                                                     |
@@ -280,7 +280,7 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 | `export_fp8.py`                          | quantizes an exported model and its drafters to FP8 weights                         |
 | `drafter/`                               | drafter model, chain sampling, fused speculative decoder                            |
 | `inference/`                             | FP8 linears (CUDA, Metal), batched speculative engine, server and benchmark         |
-| `speed.py`                               | fixed speed and equivalence harness for MPS                                         |
+| `speed.py`                               | fixed speed and equivalence harness for MPS and CUDA                                |
 | `sdk/`                                   | `jeeves_sdk`, a drop-in replacement for Jev's Python SDK with the reasoning options |
 
 ## Limitations

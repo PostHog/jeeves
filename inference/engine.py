@@ -14,7 +14,8 @@ from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
 from model.model import (EFFICIENT, FrozenRMSNorm, RMSNorm, apply_rotary, conv_step, decode_attention, delta_gates,
-                         gated_delta_rule_advance_inplace, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled, rotate_into_cache)
+                         eager_conv_step, gated_delta_rule_advance_inplace, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled,
+                         rotate_into_cache)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -22,6 +23,8 @@ from prep.format import DataFormat, Question
 MASK_ROW_ALIGNMENT = 16
 # Longer passes run eagerly at their exact length: there the GPU work outweighs the launch cost a graph removes, and padding would add to it.
 EXTEND_GRAPH_LENGTHS = (32, 64, 128, 256, 512, 1024, 1536, 2048)
+# Passes up to this length round their row count up like decode cycles, so fewer graphs are captured; on longer passes the extra rows would cost real GPU time.
+ROUNDED_ROWS_MAX_LENGTH = 256
 MANY_QUESTIONS = 3
 
 
@@ -149,7 +152,7 @@ class Engine:
             for proj in (*view.delta_q.values(), *view.delta_k.values(), *view.delta_v.values(), *view.attn_q.values()):
                 store_transposed(proj)
         # On CUDA, projections that read the same input run as one GEMM, which saves launches and reads the input once. In fp8, in_proj_b and in_proj_a stay bf16, so a delta layer's group falls back to merging just that pair.
-        self.merged_projections: dict[tuple[int, ...], nn.Module] = {}
+        self.merged_projections: dict[tuple[nn.Module, ...], nn.Module] = {}
         if self.cuda:
             groups = [(layer.linear_attn.in_proj_qkv, layer.linear_attn.in_proj_b, layer.linear_attn.in_proj_a) if layer.layer_type == LINEAR
                       else (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj) for layer in base.model.layers]
@@ -158,7 +161,7 @@ class Engine:
             for group in groups:
                 for candidate in (group, group[1:]):
                     if (merged := merge_linears_in_place(candidate)) is not None:
-                        self.merged_projections[tuple(map(id, candidate))] = merged
+                        self.merged_projections[candidate] = merged
                         break
             freeze_rms_norms(base)
             if fp8:
@@ -271,11 +274,11 @@ class Engine:
             return tuple(linear(x) for linear in linears)
         outputs, start = [], 0
         while start < len(linears):
-            end = next((end for end in range(len(linears), start + 1, -1) if tuple(map(id, linears[start:end])) in self.merged_projections), start + 1)
+            end = next((end for end in range(len(linears), start + 1, -1) if linears[start:end] in self.merged_projections), start + 1)
             if end == start + 1:
                 outputs.append(linears[start](x))
             else:
-                merged = self.merged_projections[tuple(map(id, linears[start:end]))]
+                merged = self.merged_projections[linears[start:end]]
                 outputs += merged(x).split([linear.out_features for linear in linears[start:end]], dim=-1)
             start = end
         return tuple(outputs)
@@ -307,8 +310,7 @@ class Engine:
         B, T = len(seqs), max(len(s) for s in seqs)
         Lk = max(st + len(s) for st, s in zip(starts, seqs))
         padded_T = next((n for n in EXTEND_GRAPH_LENGTHS if T <= n <= self.L), None) if self.cuda else None
-        # Short passes round their row count up like decode cycles, so fewer graphs are captured; on long passes the extra rows would cost real GPU time.
-        rows = self.decode_rows(B) if padded_T is not None and padded_T <= 256 else B
+        graph_rows = self.decode_rows(B) if padded_T is not None and padded_T <= ROUNDED_ROWS_MAX_LENGTH else B
         width = T if padded_T is None else padded_T
         ids = torch.full((B, width), self.pad, dtype=torch.long)
         valid = torch.zeros(B, width, dtype=torch.bool)
@@ -320,15 +322,15 @@ class Engine:
             dev = self.device
             return self.extend_pass(ids.to(dev), valid.to(dev), lens.to(dev), start_positions.to(dev), Lk, commit)
         padded_Lk = padded_T if max(starts) == 0 else min(max(self.window_step, 1 << (Lk - 1).bit_length()), self.L)
-        self.extend_ids[:rows, :padded_T].fill_(self.pad)
-        self.extend_valid[:rows, :padded_T].zero_()
-        self.extend_lens[:rows].zero_()
-        self.extend_starts[:rows].zero_()
+        self.extend_ids[:graph_rows, :padded_T].fill_(self.pad)
+        self.extend_valid[:graph_rows, :padded_T].zero_()
+        self.extend_lens[:graph_rows].zero_()
+        self.extend_starts[:graph_rows].zero_()
         self.extend_ids[:B, :padded_T].copy_(ids)
         self.extend_valid[:B, :padded_T].copy_(valid)
         self.extend_lens[:B].copy_(lens)
         self.extend_starts[:B].copy_(start_positions)
-        self.extend_graph(rows, padded_T, padded_Lk, commit).replay()
+        self.extend_graph(graph_rows, padded_T, padded_Lk, commit).replay()
         # A view of the shared output buffer: the next extend overwrites it.
         return self.extend_out[:B, :T]
 
@@ -338,7 +340,7 @@ class Engine:
             return graph
         inputs = (self.extend_ids[:B, :T], self.extend_valid[:B, :T], self.extend_lens[:B], self.extend_starts[:B], Lk, commit)
         # A committing warm-up advances conv and rec, so they are restored before the caller's replay.
-        states = [t[:B] for d in (self.conv, self.rec) for t in d.values()] if commit else []
+        states = [self.conv_states[:, :B], *(t[:B] for t in self.rec.values())] if commit else []
         saved = [t.clone() for t in states]
         graph = self.captured(lambda: self.extend_out[:B, :T].copy_(self.extend_pass(*inputs)), warmups=1)
         for t, s in zip(states, saved):
@@ -372,13 +374,7 @@ class Engine:
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 qkv, b_in, a_in = self.project(h, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
-                ext = torch.cat((self.conv[i][:B], qkv.transpose(1, 2)), dim=-1)
-                conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -T:]).transpose(1, 2)
-                q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
-                rep = lin.num_v_heads // lin.num_k_heads
-                q = q.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                k = k.reshape(B, T, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                v = v.reshape(B, T, lin.num_v_heads, lin.head_v_dim)
+                ext, q, k, v = eager_conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, lin.key_dim, lin.value_dim, lin.head_k_dim, lin.head_v_dim)
                 beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i], valid)
                 o = self.delta_extend(q, k, v, g, beta, self.rec[i][:B], commit)
                 if commit:
@@ -428,13 +424,14 @@ class Engine:
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
                 hc, hm = self.split_candidate_rows(h, K)
                 qkv, b_in, a_in = self.project(hc, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
-                _, q, k, v = conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, lin.key_dim, lin.value_dim, lin.head_k_dim, Dv,
-                                       Hv // lin.num_k_heads, ext_out=self.conv_inputs[K][self.conv_slot[i], :B])
+                _, q, k, v = conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, key_dim=lin.key_dim, value_dim=lin.value_dim,
+                                       head_k_dim=lin.head_k_dim, head_v_dim=Dv, ext_out=self.conv_inputs[K][self.conv_slot[i], :B])
                 beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i])
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta)
                 qm, km, vm = (t.view(B, M, Hv, Dv) for t in self.project(hm, view.delta_q[key], view.delta_k[key], view.delta_v[key]))
-                qm = rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, self.dk[i], self.dv[i], rows, pos_c, Lw)
+                qm = rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache=self.dk[i], v_cache=self.dv[i], rows=rows,
+                                       positions=pos_c, tail_start=Lw)
                 o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
                 o = torch.cat((o_c, o_m), dim=1)
                 z = lin.in_proj_z(h).view(B, K + M, Hv, Dv)
@@ -530,9 +527,9 @@ class Engine:
         return F.softmax(logits[0], dim=-1).tolist()
 
     def reset(self, B: int) -> None:
-        for i in self.conv:
-            self.conv[i][:B].zero_()
-            self.rec[i][:B].zero_()
+        self.conv_states[:, :B].zero_()
+        for t in self.rec.values():
+            t[:B].zero_()
 
     def broadcast(self, B: int, P: int) -> None:
         if B == 1:
@@ -540,9 +537,9 @@ class Engine:
         for d in (self.k, self.v, self.dk, self.dv):
             for t in d.values():
                 t[1:B, :P].copy_(t[:1, :P].expand(B - 1, -1, -1, -1))
-        for d in (self.conv, self.rec):
-            for t in d.values():
-                t[1:B].copy_(t[:1].expand(B - 1, *t.shape[1:]))
+        self.conv_states[:, 1:B].copy_(self.conv_states[:, :1].expand(-1, B - 1, -1, -1))
+        for t in self.rec.values():
+            t[1:B].copy_(t[:1].expand(B - 1, *t.shape[1:]))
 
     @torch.no_grad()
     def answer(self, record: DataFormat, opts: Options) -> list[Result]:
@@ -551,10 +548,9 @@ class Engine:
     @torch.no_grad()
     def answer_batch(self, jobs: list[tuple[DataFormat, Options]]) -> list[list[Result]]:
         results: list[list[Result | None]] = [[None] * len(record.questions) for record, _ in jobs]
-        # Thinking and no-think requests never share a group, so no-think rows hold no decode rows, and whole requests are packed together
-        # where they fit, so that a request's questions keep sharing their prompt prefix.
+        # A row that cannot think would hold a decode row in a thinking group. group() shares only the prompt prefix common to all its rows, so a request's text is shared only in a group that holds no other request.
         for thinking in (False, True):
-            requests = [job for job, (_, opts) in enumerate(jobs) if opts.think == thinking]
+            requests = [job for job, (_, opts) in enumerate(jobs) if (opts.think and opts.max_think > 0) == thinking]
             for group in pack_requests([len(jobs[job][0].questions) for job in requests], self.R):
                 rows = [GroupRow(jobs[requests[r]][0], jobs[requests[r]][0].questions[i], jobs[requests[r]][1]) for r, i in group]
                 for (r, i), result in zip(group, self.group(rows)):

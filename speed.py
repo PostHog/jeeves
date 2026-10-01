@@ -46,7 +46,7 @@ def answer_all(engine: Engine, jobs: list[tuple[DataFormat, Options]], batch: bo
     return engine.answer_batch(jobs) if batch else [engine.answer(rec, opts) for rec, opts in jobs]
 
 
-def run(engine: Engine, jobs: list[tuple[DataFormat, Options]], batch: bool = False) -> list[list[dict]]:
+def run(engine: Engine, jobs: list[tuple[DataFormat, Options]], batch: bool) -> list[list[dict]]:
     return [[as_record(r) for r in results] for results in answer_all(engine, jobs, batch)]
 
 
@@ -62,7 +62,7 @@ def compare(outputs: list[list[dict]], reference: list[list[dict]]) -> dict:
             "argmax_agree": f"{sum(argmax(a['probs']) == argmax(b['probs']) for a, b in pairs)}/{len(pairs)}"}
 
 
-def speed(engine: Engine, records: list[DataFormat], batch: bool = False) -> tuple[dict, list[list[dict]]]:
+def speed(engine: Engine, records: list[DataFormat], batch: bool) -> tuple[dict, list[list[dict]]]:
     jobs = workload(records)
     times, outputs = [], []
     for _ in range(RUNS):
@@ -79,7 +79,7 @@ def speed(engine: Engine, records: list[DataFormat], batch: bool = False) -> tup
     return summary, outputs[0]
 
 
-def evaluate(engine: Engine, records: list[DataFormat], n: int, batch: bool = False) -> tuple[dict, list[list[dict]]]:
+def evaluate(engine: Engine, records: list[DataFormat], n: int, batch: bool) -> tuple[dict, list[list[dict]]]:
     chosen = random.Random(1).sample(records, n)
     rows, outputs = [], []
     t0 = time.perf_counter()
@@ -99,7 +99,7 @@ def evaluate(engine: Engine, records: list[DataFormat], n: int, batch: bool = Fa
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Fixed MPS speed and equivalence harness: 6 runs, drop the first, trimmed mean of the middle 3.")
+    ap = argparse.ArgumentParser(description="Fixed speed and equivalence harness: 6 runs, drop the first, trimmed mean of the middle 3.")
     ap.add_argument("--data", required=True)
     ap.add_argument("--model", default=None)
     ap.add_argument("--eval", type=int, default=0)

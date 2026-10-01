@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -8,6 +10,14 @@ from triton.language.extra import libdevice
 LOG2E = tl.constexpr(1.4426950408889634)
 # One program keeps every query row of a key head in registers (its query rows times the heads that share it), which bounds their number.
 DECODE_ATTENTION_MAX_ROWS = 64
+DECODE_ATTENTION_BLOCK_N = 64
+# Fewer channels per program spread one question's conv over more SMs: 128 ran 3x faster than 512 on an H100 PCIe (2026-10-01).
+CONV_STEP_BLOCK_C = 128
+
+
+@lru_cache
+def sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 # Triton folds a float32 -> bf16 -> float32 round trip away and fuses what is left into FMAs, so rounding goes through the bits.
@@ -20,16 +30,16 @@ def _round_to_bf16(x):
 
 # Rounds cos, sin, both products and their sum to bf16, like apply_rotary's eager path on bf16.
 @triton.jit
-def _rotated(x, cos, sin, x_row, cos_row, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
+def _rotated(x, cos, sin, x_offset, cos_offset, D: tl.constexpr, N_FREQS: tl.constexpr, BLOCK: tl.constexpr):
     d = tl.arange(0, BLOCK)
     inside = d < D
     rotated = d < 2 * N_FREQS
     lower = d < N_FREQS
     freq = tl.where(lower, d, d - N_FREQS)
-    value = tl.load(x + x_row + d, mask=inside, other=0.0).to(tl.float32)
-    partner = tl.load(x + x_row + tl.where(lower, d + N_FREQS, d - N_FREQS), mask=rotated, other=0.0).to(tl.float32)
-    c = _round_to_bf16(tl.load(cos + cos_row + freq, mask=rotated, other=0.0).to(tl.float32))
-    s = _round_to_bf16(tl.load(sin + cos_row + freq, mask=rotated, other=0.0).to(tl.float32))
+    value = tl.load(x + x_offset + d, mask=inside, other=0.0).to(tl.float32)
+    partner = tl.load(x + x_offset + tl.where(lower, d + N_FREQS, d - N_FREQS), mask=rotated, other=0.0).to(tl.float32)
+    c = _round_to_bf16(tl.load(cos + cos_offset + freq, mask=rotated, other=0.0).to(tl.float32))
+    s = _round_to_bf16(tl.load(sin + cos_offset + freq, mask=rotated, other=0.0).to(tl.float32))
     turned = tl.where(lower, -partner, partner)
     y = _round_to_bf16(value * c) + _round_to_bf16(turned * s)
     return tl.where(rotated, y, value).to(tl.bfloat16)
@@ -145,18 +155,23 @@ def _decode_attention_combine(partial_o, partial_lse, o, splits, stride_ob, stri
     s = tl.arange(0, BLOCK_SPLITS)
     s_ok = s < splits
     lse = tl.load(partial_lse + (bh * splits + s) * BLOCK_Q + rq, mask=s_ok, other=float("-inf"))
-    weight = tl.exp2(lse - tl.max(lse, 0))
+    top = tl.max(lse, 0)
+    # A query row with every key masked has an lse of -inf in every split, and gets zeros instead of NaN.
+    weight = tl.exp2(lse - tl.where(top == float("-inf"), 0.0, top))
+    total = tl.sum(weight, 0)
     d = tl.arange(0, D)
     parts = tl.load(partial_o + ((bh * splits + s[:, None]) * BLOCK_Q + rq) * D + d[None, :], mask=s_ok[:, None], other=0.0)
-    out = tl.sum(parts * weight[:, None], 0) / tl.sum(weight, 0)
+    out = tl.sum(parts * weight[:, None], 0) / tl.where(total > 0.0, total, 1.0)
     tl.store(o + b * stride_ob + row * stride_or + head * stride_oh + d, out.to(o.dtype.element_ty))
 
 
 def decode_attention_supported(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor) -> bool:
     B, R, H, D = q.shape
-    Hkv = k_cache.shape[2]
+    Hkv, L = k_cache.shape[2], mask.shape[-1]
     return (q.dtype == k_cache.dtype == v_cache.dtype == mask.dtype == torch.bfloat16 and H % Hkv == 0 and D & (D - 1) == 0
-            and R * (H // Hkv) <= DECODE_ATTENTION_MAX_ROWS and mask.shape[1] == 1 and all(t.stride(-1) == 1 for t in (q, k_cache, v_cache, mask)))
+            and R * (H // Hkv) <= DECODE_ATTENTION_MAX_ROWS and mask.shape == (B, 1, R, L) and v_cache.shape == k_cache.shape
+            and k_cache.shape[0] >= B and k_cache.shape[1] >= L and k_cache.shape[3] == D
+            and all(t.stride(-1) == 1 for t in (q, k_cache, v_cache, mask)))
 
 
 def decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
@@ -164,25 +179,25 @@ def decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tens
     L, Hkv = mask.shape[-1], k_cache.shape[2]
     if not decode_attention_supported(q, k_cache, v_cache, mask):
         raise ValueError(f"decode_attention needs bfloat16 inputs with contiguous last dims, a power-of-two head dim, query heads a multiple of the "
-                         f"key heads, at most {DECODE_ATTENTION_MAX_ROWS} query rows per key head and a mask with one head; got q {tuple(q.shape)}, "
-                         f"k_cache {tuple(k_cache.shape)}, mask {tuple(mask.shape)}")
+                         f"key heads, at most {DECODE_ATTENTION_MAX_ROWS} query rows per key head, a (B, 1, R, L) mask and caches with at least "
+                         f"B rows and L positions; got q {tuple(q.shape)}, k_cache {tuple(k_cache.shape)}, v_cache {tuple(v_cache.shape)}, "
+                         f"mask {tuple(mask.shape)}")
     G = H // Hkv
     o = torch.empty_like(q)
     if B == 0 or L == 0:
         return o.zero_()
-    block_n = 64
     block_q = max(16, triton.next_power_of_2(R * G))
-    blocks = triton.cdiv(L, block_n)
+    blocks = triton.cdiv(L, DECODE_ATTENTION_BLOCK_N)
     # Each slice writes a float32 partial of block_q x D values: many slices hide latency when the partials are small, but large partials cost more to write and combine than the latency they hide.
-    programs = torch.cuda.get_device_properties(q.device).multi_processor_count * (4 if block_q * D <= 4096 else 1)
+    programs = sm_count(q.device) * (4 if block_q * D <= 4096 else 1)
     splits = max(1, min(blocks, triton.cdiv(programs, B * Hkv)))
-    keys_per_split = triton.cdiv(blocks, splits) * block_n
+    keys_per_split = triton.cdiv(blocks, splits) * DECODE_ATTENTION_BLOCK_N
     splits = triton.cdiv(L, keys_per_split)
     partial_o = torch.empty(B * Hkv * splits * block_q, D, device=q.device, dtype=torch.float32)
     partial_lse = torch.empty(B * Hkv * splits * block_q, device=q.device, dtype=torch.float32)
     _decode_attention_split[(B * Hkv, splits)](q, k_cache, v_cache, mask, partial_o, partial_lse, scale * LOG2E.value, L, keys_per_split,
                                                splits, *q.stride()[:3], *k_cache.stride()[:3], *v_cache.stride()[:3], mask.stride(0),
-                                               mask.stride(2), HKV=Hkv, R=R, G=G, D=D, BLOCK_Q=block_q, BLOCK_N=block_n,
+                                               mask.stride(2), HKV=Hkv, R=R, G=G, D=D, BLOCK_Q=block_q, BLOCK_N=DECODE_ATTENTION_BLOCK_N,
                                                num_warps=4 if D <= 128 else 8, num_stages=2)
     _decode_attention_combine[(B * Hkv, R * G)](partial_o, partial_lse, o, splits, *o.stride()[:3], HKV=Hkv, G=G, D=D, BLOCK_Q=block_q,
                                                 BLOCK_SPLITS=triton.next_power_of_2(splits), num_warps=4)
@@ -249,10 +264,12 @@ def _conv_step(state, qkv, weight, ext, q_out, k_out, v_out, C, stride_qkv_b, st
     c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     inside = c < C
     ext_row = ext + (b * C + c) * (TAPS + T)
+    state_row = state + (b * C + c) * TAPS
+    qkv_row = qkv + b * stride_qkv_b + c
     for i in tl.static_range(TAPS):
-        tl.store(ext_row + i, tl.load(state + (b * C + c) * TAPS + i, mask=inside, other=0.0), mask=inside)
+        tl.store(ext_row + i, tl.load(state_row + i, mask=inside, other=0.0), mask=inside)
     for t in tl.static_range(T):
-        tl.store(ext_row + TAPS + t, tl.load(qkv + b * stride_qkv_b + t * stride_qkv_t + c, mask=inside, other=0.0), mask=inside)
+        tl.store(ext_row + TAPS + t, tl.load(qkv_row + t * stride_qkv_t, mask=inside, other=0.0), mask=inside)
     is_q = c < KEY_DIM
     is_k = (c >= KEY_DIM) & (c < 2 * KEY_DIM)
     is_v = (c >= 2 * KEY_DIM) & inside
@@ -262,7 +279,12 @@ def _conv_step(state, qkv, weight, ext, q_out, k_out, v_out, C, stride_qkv_b, st
         acc = tl.zeros([BLOCK_C], dtype=tl.float32)
         for i in tl.static_range(TAPS):
             tap = tl.load(weight + c * TAPS + i, mask=inside, other=0.0).to(tl.float32)
-            acc += tap * tl.load(ext_row + t + 1 + i, mask=inside, other=0.0).to(tl.float32)
+            # Each input comes from the state or qkv rather than from ext, so no thread reads an element of ext that another thread stored.
+            if t + 1 + i < TAPS:
+                value = tl.load(state_row + t + 1 + i, mask=inside, other=0.0)
+            else:
+                value = tl.load(qkv_row + (t + 1 + i - TAPS) * stride_qkv_t, mask=inside, other=0.0)
+            acc += tap * value.to(tl.float32)
         x = _round_to_bf16(acc)
         y = tl.math.div_rn(x, 1.0 + libdevice.exp(-x)).to(tl.bfloat16)
         for r in tl.static_range(REP):
@@ -273,9 +295,13 @@ def _conv_step(state, qkv, weight, ext, q_out, k_out, v_out, C, stride_qkv_b, st
 
 
 def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int,
-              rep: int, ext_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+              ext_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, C = qkv.shape
     taps = state.shape[-1]
+    k_heads, v_heads = key_dim // head_k_dim, value_dim // head_v_dim
+    if key_dim % head_k_dim or value_dim % head_v_dim or v_heads % k_heads:
+        raise ValueError(f"the key and value dims must hold whole heads, and the value heads a whole number per key head; got {key_dim}, {value_dim}")
+    rep = v_heads // k_heads
     if qkv.stride(-1) != 1 or not state.is_contiguous() or not weight.is_contiguous() or C != 2 * key_dim + value_dim:
         raise ValueError("qkv needs contiguous channels, state and weight must be contiguous, and qkv must hold q, k and v")
     if state.shape != (B, C, taps) or weight.shape != (C, 1, taps) or any(t.dtype != torch.bfloat16 for t in (state, qkv, weight)):
@@ -284,11 +310,10 @@ def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_
     ext = torch.empty(B, C, taps + T, dtype=qkv.dtype, device=qkv.device) if ext_out is None else ext_out
     if ext.shape != (B, C, taps + T) or ext.dtype != torch.bfloat16 or not ext.is_contiguous():
         raise ValueError(f"ext_out: expected a contiguous bfloat16 tensor of shape {(B, C, taps + T)}, got {ext.dtype} {tuple(ext.shape)}")
-    q = torch.empty(B, T, key_dim // head_k_dim * rep, head_k_dim, dtype=qkv.dtype, device=qkv.device)
+    q = torch.empty(B, T, v_heads, head_k_dim, dtype=qkv.dtype, device=qkv.device)
     k = torch.empty_like(q)
-    v = torch.empty(B, T, value_dim // head_v_dim, head_v_dim, dtype=qkv.dtype, device=qkv.device)
-    block_c = 128
-    _conv_step[(B, triton.cdiv(C, block_c))](state, qkv, weight, ext, q, k, v, C, qkv.stride(0), qkv.stride(1), T=T, TAPS=taps,
-                                            KEY_DIM=key_dim, VALUE_DIM=value_dim, DK=head_k_dim, REP=rep, BLOCK_C=block_c,
-                                            enable_reflect_ftz=False)
+    v = torch.empty(B, T, v_heads, head_v_dim, dtype=qkv.dtype, device=qkv.device)
+    _conv_step[(B, triton.cdiv(C, CONV_STEP_BLOCK_C))](state, qkv, weight, ext, q, k, v, C, qkv.stride(0), qkv.stride(1), T=T, TAPS=taps,
+                                                      KEY_DIM=key_dim, VALUE_DIM=value_dim, DK=head_k_dim, REP=rep, BLOCK_C=CONV_STEP_BLOCK_C,
+                                                      enable_reflect_ftz=False)
     return ext, q, k, v

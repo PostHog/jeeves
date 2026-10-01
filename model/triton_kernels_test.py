@@ -165,20 +165,22 @@ def cache_writes() -> list[str]:
 def conv_steps() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(9)
-    key_dim, value_dim, head_dim, rep, taps = 2048, 4096, 128, 2, 4
+    key_dim, value_dim, head_dim, taps = 2048, 4096, 128, 4
     C = 2 * key_dim + value_dim
     for B, T in ((1, 4), (4, 4), (2, 8)):
         merged = (torch.randn(B, T, C + 64, generator=gen) * 2).to(torch.bfloat16).to(CUDA)
         state = torch.randn(B, C, taps, generator=gen).to(torch.bfloat16).to(CUDA)
         weight = (torch.randn(C, 1, taps, generator=gen) * 0.5).to(torch.bfloat16).to(CUDA)
-        eager, out = eager_then_triton(lambda: conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim, rep))
+        eager, out = eager_then_triton(lambda: conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim))
         for name, x, y in zip(("ext", "q", "k", "v"), out, eager):
             if not same_bits(x, y):
                 failures.append(f"conv_step {(B, T)}: the Triton kernel's {name} is not bitwise equal to eager")
+        # NaN in ext_out shows any output that reads ext before every thread has written it.
         stacked = torch.zeros(3, B, C, taps + T, dtype=torch.bfloat16, device=CUDA)
-        out = conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim, rep, ext_out=stacked[1])
-        if out[0].data_ptr() != stacked[1].data_ptr() or not same_bits(stacked[1], eager[0]) or stacked[0].any() or stacked[2].any():
-            failures.append(f"conv_step {(B, T)}: the Triton kernel did not write ext into ext_out alone")
+        stacked[1] = float("nan")
+        out = conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim, ext_out=stacked[1])
+        if out[0].data_ptr() != stacked[1].data_ptr() or not all(same_bits(x, y) for x, y in zip(out, eager)) or stacked[0].any() or stacked[2].any():
+            failures.append(f"conv_step {(B, T)}: with ext_out, the Triton kernel did not write ext there alone, or its outputs changed")
     return failures
 
 
