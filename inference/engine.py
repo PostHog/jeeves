@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -17,6 +18,28 @@ from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
 EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
+MANY_QUESTIONS = 3
+
+
+@dataclass(frozen=True)
+class DecodeBlock:
+    K: int
+    J: int
+    M: int
+    ar_k: torch.Tensor
+    ar_j: torch.Tensor
+    mask_offset: torch.Tensor
+    limit_offset: torch.Tensor
+    allow_mm: torch.Tensor
+
+
+def decode_block(K: int, device: torch.device) -> DecodeBlock:
+    J = K - 1
+    ar_k, ar_j = torch.arange(K, device=device), torch.arange(J, device=device)
+    block_of_mask = ar_k.repeat_interleave(J)
+    row_block = torch.cat((torch.full((K,), -1, device=device), block_of_mask))
+    allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
+    return DecodeBlock(K, J, K * J, ar_k, ar_j, block_of_mask + (ar_j + 1).repeat(K), torch.cat((ar_k, block_of_mask)), allow_mm)
 
 
 def delta_step(q, k, v, g, beta, state, final: bool):
@@ -49,22 +72,23 @@ class Engine:
         if fp8 and not fp8_supported:
             raise ValueError("precision='fp8' needs a CUDA GPU with compute capability 8.9 or higher, or MPS with the Metal kernels enabled "
                              "(unset QWEN35_KERNELS=0)")
-        base, head, encoder = load_export(model, device=dev)
-        view = DrafterView(base, block=block).to(dev)
-        loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
-        missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
-        if loaded.unexpected_keys or missing:
-            raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
-        view.requires_grad_(False)
-        self.dtype = base.lm_head.weight.dtype
-        if fp8 and self.mps:
-            from inference.fp8_metal import quantize
-            quantize(view)
-        elif fp8:
-            from inference.fp8 import quantize, warm
-            quantize(view)
-            warm(view)
+        if fp8:
+            if self.mps:
+                from inference.fp8_metal import load_view
+            else:
+                from inference.fp8 import load_view
+            view, head, encoder = load_view(model, drafter, block, dev)
+            base = view.base
+            self.dtype = base.model.embed_tokens.weight.dtype
         else:
+            base, head, encoder = load_export(model, device=dev)
+            view = DrafterView(base, block=block).to(dev)
+            loaded = view.load_state_dict(load_file(drafter, device=str(dev)), strict=False)
+            missing = [k for k in loaded.missing_keys if not k.startswith("base.")]
+            if loaded.unexpected_keys or missing:
+                raise ValueError(f"drafter keys do not match: unexpected {loaded.unexpected_keys[:3]}, missing {missing[:3]}")
+            view.requires_grad_(False)
+            self.dtype = base.lm_head.weight.dtype
             for proj in view.projections():
                 proj.to(self.dtype)
         if self.mps and not fp8 and torch.backends.mps.is_macos_or_newer(15, 0):
@@ -79,8 +103,8 @@ class Engine:
         self.base, self.head, self.encoder, self.view = base, head, encoder, view
         self.cfg = cfg = base.cfg
         self.K = K = block
-        self.J = J = K - 1
-        self.M = K * J
+        self.J = K - 1
+        self.M = K * self.J
         self.R, self.L = max_rows, max_len
         self.trash = max_len + self.M
         slots = max_len + self.M + 1
@@ -112,15 +136,12 @@ class Engine:
         self.done = torch.ones(max_rows, dtype=torch.bool, device=dev)
         self.cand = torch.zeros(max_rows, K, dtype=torch.long, device=dev)
         self.out = torch.zeros(max_rows, max_len + K, dtype=torch.long, device=dev)
-        self.ar_k = torch.arange(K, device=dev)
-        self.ar_j = torch.arange(J, device=dev)
         self.ar_l = torch.arange(max_len + 1, device=dev)
-        block_of_mask = torch.arange(K, device=dev).repeat_interleave(J)
-        self.mask_offset = block_of_mask + (self.ar_j + 1).repeat(K)
-        self.limit_offset = torch.cat((self.ar_k, block_of_mask))
-        row_block = torch.cat((torch.full((K,), -1, device=dev), block_of_mask))
-        self.allow_mm = (row_block[:, None] == block_of_mask[None, :]) & (row_block[:, None] >= 0)
-        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.block = decode_block(K, dev)
+        # Tuned on an M4 Pro with torch 2.14: in FP8, a cycle of MANY_QUESTIONS or more is compute-bound, so block 2's 4 rows per question
+        # beat block 4's 16 rows even though block 2 accepts fewer tokens. In bf16 they do not, because MPS's bf16 matmul is slow at 9 to 15 rows.
+        self.many_questions_block = decode_block(2, dev) if self.mps and fp8 and K > 2 else self.block
+        self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if dev.type == "cuda" else None
 
     @property
@@ -159,8 +180,8 @@ class Engine:
             return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
                                                   enable_gqa=gqa).transpose(1, 2)
 
-    def split_candidate_rows(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hc, hm = h[:, :self.K], h[:, self.K:]
+    def split_candidate_rows(self, h: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+        hc, hm = h[:, :K], h[:, K:]
         # With more than one row hc is strided, and MPS multiplies a strided input by the untransposed candidate weights about 2x slower.
         return (hc.contiguous() if self.mps else hc), hm
 
@@ -236,19 +257,19 @@ class Engine:
             x = x + layer.mlp(layer.post_attention_layernorm(x))
         return base.model.norm(x)
 
-    def cycle(self, B: int, Lw: int) -> None:
+    def cycle(self, B: int, Lw: int, block: DecodeBlock) -> None:
         base, view = self.base, self.view
-        K, J, M = self.K, self.J, self.M
-        n, done, cand = self.n[:B], self.done[:B], self.cand[:B]
-        pos_c = n[:, None] + self.ar_k[None]
-        pos = torch.cat((pos_c, n[:, None] + self.mask_offset[None]), dim=1)
+        K, J, M = block.K, block.J, block.M
+        n, done, cand = self.n[:B], self.done[:B], self.cand[:B, :K]
+        pos_c = n[:, None] + block.ar_k[None]
+        pos = torch.cat((pos_c, n[:, None] + block.mask_offset[None]), dim=1)
         cos, sin = base.model.rotary_emb(pos)
         cos_c, sin_c, cos_m, sin_m = (t.contiguous() for t in (cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:]))
         used_end = n + K if self.metal else None
         rows = torch.arange(B, device=self.device)[:, None].expand(B, K)
-        limit = n[:, None] + self.limit_offset[None]
+        limit = n[:, None] + block.limit_offset[None]
         allow_cache = self.ar_l[:Lw][None, None, :] <= limit[:, :, None]
-        mask = torch.cat((allow_cache, self.allow_mm[None].expand(B, -1, -1)), dim=2)[:, None]
+        mask = torch.cat((allow_cache, block.allow_mm[None].expand(B, -1, -1)), dim=2)[:, None]
         x = torch.cat((base.model.embed_tokens(cand), self.mask_embed.view(1, 1, -1).expand(B, M, -1)), dim=1)
         pending = {}
         for i, layer in enumerate(self.layers):
@@ -257,7 +278,7 @@ class Engine:
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
-                hc, hm = self.split_candidate_rows(h)
+                hc, hm = self.split_candidate_rows(h, K)
                 ext = torch.cat((self.conv[i][:B], lin.in_proj_qkv(hc).transpose(1, 2)), dim=-1)
                 conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -K:]).transpose(1, 2)
                 q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
@@ -284,7 +305,7 @@ class Engine:
             else:
                 att = layer.self_attn
                 H, Hkv, D = att.num_heads, att.num_kv_heads, att.head_dim
-                hc, hm = self.split_candidate_rows(h)
+                hc, hm = self.split_candidate_rows(h, K)
                 qc, gc = att.q_proj(hc).view(B, K, H, 2 * D).chunk(2, dim=-1)
                 qm, gm = view.attn_q[key](hm).view(B, M, H, 2 * D).chunk(2, dim=-1)
                 q = apply_rotary(att.q_norm(torch.cat((qc, qm), 1)), cos, sin)
@@ -303,14 +324,14 @@ class Engine:
         pred = am[:, :K]
         match = (cand[:, 1:] == pred[:, :-1]).long()
         j = torch.cumprod(match, 1).sum(1) + 1
-        first_eos = torch.where(cand == self.eos, self.ar_k[None], K).amin(1)
+        first_eos = torch.where(cand == self.eos, block.ar_k[None], K).amin(1)
         j = torch.minimum(j, first_eos + 1)
         j = torch.minimum(j, self.cap[:B] - self.n_out[:B])
         j = torch.where(done, 0, j)
         jm1 = (j - 1).clamp(min=0)
-        nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + self.ar_j[None])), dim=1)
-        self.out[:B].scatter_(1, self.n_out[:B, None] + self.ar_k[None], cand)
-        keep = None if self.metal else (self.ar_k[None] < j[:, None]).float()[..., None]
+        nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + block.ar_j[None])), dim=1)
+        self.out[:B].scatter_(1, self.n_out[:B, None] + block.ar_k[None], cand)
+        keep = None if self.metal else (block.ar_k[None] < j[:, None]).float()[..., None]
         for i, (k, v, g, beta, ext) in pending.items():
             self.delta_commit(k, v, g, beta, self.rec[i][:B], j, keep)
             idx = (j[:, None] + torch.arange(ext.shape[-1] - K, device=self.device)[None])[:, None, :].expand(B, ext.shape[1], -1)
@@ -320,8 +341,8 @@ class Engine:
         n.add_(j)
         self.n_out[:B].add_(j)
 
-    def graph(self, B: int, Lw: int) -> torch.cuda.CUDAGraph:
-        g = self.graphs.get((B, Lw))
+    def graph(self, B: int, Lw: int, block: DecodeBlock) -> torch.cuda.CUDAGraph:
+        g = self.graphs.get((B, Lw, block.K))
         if g is not None:
             return g
         saved = self.done[:B].clone()
@@ -330,19 +351,19 @@ class Engine:
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(2):
-                self.cycle(B, Lw)
+                self.cycle(B, Lw, block)
         torch.cuda.current_stream().wait_stream(stream)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
-            self.cycle(B, Lw)
+            self.cycle(B, Lw, block)
         self.done[:B].copy_(saved)
-        self.graphs[(B, Lw)] = g
+        self.graphs[(B, Lw, block.K)] = g
         return g
 
-    def cycle_runner(self, B: int, Lw: int) -> Callable[[], None]:
+    def cycle_runner(self, B: int, Lw: int, block: DecodeBlock) -> Callable[[], None]:
         if self.device.type == "cuda":
-            return self.graph(B, Lw).replay
-        return lambda: self.cycle(B, Lw)
+            return self.graph(B, Lw, block).replay
+        return lambda: self.cycle(B, Lw, block)
 
     @torch.no_grad()
     def decode(self, B: int, prompts: list[list[int]], first: torch.Tensor, caps: list[int]) -> tuple[list[list[int]], list[bool]]:
@@ -358,9 +379,10 @@ class Engine:
         self.cand[:Bp].zero_()
         self.cand[:B, 0].copy_(first)
         top = max(len(p) for p in prompts)
+        block = self.many_questions_block if B >= MANY_QUESTIONS else self.block
         while True:
-            need = top + (self.sync_every + 1) * self.K + 1
-            run_cycle = self.cycle_runner(Bp, min(self.L, -(-need // self.window_step) * self.window_step))
+            need = top + (self.sync_every + 1) * block.K + 1
+            run_cycle = self.cycle_runner(Bp, min(self.L, -(-need // self.window_step) * self.window_step), block)
             for _ in range(self.sync_every):
                 run_cycle()
             finished, top = torch.stack((self.done[:Bp].all().long(), self.n[:B].max())).tolist()
