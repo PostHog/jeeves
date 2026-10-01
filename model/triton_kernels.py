@@ -285,7 +285,7 @@ def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_
     q = torch.empty(B, T, key_dim // head_k_dim * rep, head_k_dim, dtype=qkv.dtype, device=qkv.device)
     k = torch.empty_like(q)
     v = torch.empty(B, T, value_dim // head_v_dim, head_v_dim, dtype=qkv.dtype, device=qkv.device)
-    block_c = 512
+    block_c = 128
     _conv_step[(B, triton.cdiv(C, block_c))](state, qkv, weight, ext, q, k, v, C, qkv.stride(0), qkv.stride(1), T=T, TAPS=taps,
                                             KEY_DIM=key_dim, VALUE_DIM=value_dim, DK=head_k_dim, REP=rep, BLOCK_C=block_c,
                                             enable_reflect_ftz=False)
