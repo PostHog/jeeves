@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from . import metal
@@ -23,10 +24,13 @@ try:
 except ImportError:
     _fla_chunk_gdr = _fla_recurrent_gdr = None
 try:
-    import triton
-    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel as _fla_recurrent_kernel
+    from . import fla_inplace
 except ImportError:
-    triton = _fla_recurrent_kernel = None
+    fla_inplace = None
+try:
+    from . import triton_kernels
+except ImportError:
+    triton_kernels = None
 try:
     from fla.modules.layernorm import rms_norm as _fla_rms_norm
 except ImportError:
@@ -67,9 +71,11 @@ _AVAILABLE = {
     "causal_conv1d": _fla_causal_conv1d is not None and _fla_causal_conv1d_update is not None,
     "flash_attn": _flash_attn_func is not None,
     "metal": torch.backends.mps.is_available(),
+    "triton_inference": triton_kernels is not None,
 }
 _ENABLED_BY_ENV = os.environ.get("QWEN35_KERNELS", "1") not in ("0", "false", "False")
 KERNELS = {k: v and _ENABLED_BY_ENV for k, v in _AVAILABLE.items()}
+EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 
 
 def set_kernels(**flags: bool) -> dict[str, bool]:
@@ -100,6 +106,10 @@ def _on_metal(*xs: torch.Tensor) -> bool:
     return metal_enabled() and all(x.is_mps and x.dtype == torch.bfloat16 for x in xs) and not _needs_grad(*xs)
 
 
+def _on_triton_inference(x: torch.Tensor, *others: torch.Tensor) -> bool:
+    return _on("triton_inference", x) and x.dtype == torch.bfloat16 and not torch.compiler.is_compiling() and not _needs_grad(x, *others)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -117,6 +127,18 @@ class RMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
+
+class FrozenRMSNorm(RMSNorm):
+    def __init__(self, norm: RMSNorm):
+        super().__init__(norm.weight.shape[0], norm.eps)
+        self.weight = norm.weight
+        self.register_buffer("shifted_weight", 1.0 + norm.weight.detach().float(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _on("rms_norm", x):
+            return _fla_rms_norm(x, self.shifted_weight, None, eps=self.eps)
+        return super().forward(x)
 
 
 class GatedRMSNorm(nn.Module):
@@ -160,6 +182,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     if x.dim() == 4 and _on_metal(x) and not _needs_grad(cos, sin):
         return metal.rotary(x, cos, sin)
+    # Only for per-row positions (3-D cos), where the kernel replaces the eager path. fla's rotary serves 2-D cos and rounds differently.
+    if x.dim() == 4 and cos.dim() == 3 and _on_triton_inference(x, cos, sin):
+        return triton_kernels.rotary(x, cos, sin)
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)
     if cos.dim() == 2 and _on("rotary", x):
         return _fla_rotary(x, cos, sin, interleaved=False)
@@ -269,25 +294,71 @@ def gated_delta_rule_chunk(q, k, v, g, beta, initial_state=None, output_final_st
                                         output_final_state=output_final_state)
 
 
-def gated_delta_rule_step_inplace(q, k, v, g, beta, state):
-    B, T, H, K = k.shape
-    HV, V = v.shape[2], v.shape[3]
-    BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V))
-    o = torch.empty_like(v)
-    _fla_recurrent_kernel[(triton.cdiv(V, BV), B * HV)](
-        q=q, k=k, v=v, g=g, gk=None, gv=None, beta=beta, A_log=None, dt_bias=None, o=o, h0=state, ht=state, cu_seqlens=None,
-        scale=K**-0.5, T=T, H=H, HV=HV, K=K, V=V, BK=BK, BV=BV, IS_BETA_HEADWISE=True, USE_QK_L2NORM_IN_KERNEL=True,
-        APPLY_BETA_SIGMOID=False, ALLOW_NEG_EIGVAL=False, STATE_V_FIRST=False, num_warps=1, num_stages=3)
-    return o
-
-
 def gated_delta_rule_step(q, k, v, g, beta, initial_state=None, output_final_state=True):
     if _on("gdn", q) and not _needs_grad(q, k, v, g, beta):
         return _fla_recurrent_gdr(q, k, v, g=g, beta=beta, initial_state=initial_state,
                                   output_final_state=output_final_state, use_qk_l2norm_in_kernel=True)
     return torch_recurrent_gated_delta_rule(q, k, v, g, beta, initial_state=initial_state,
                                             output_final_state=output_final_state)
+
+
+def gated_delta_rule_advance_inplace(k, v, g, beta, state, steps) -> None:
+    # The kernel rounds like fla's, so it runs only where the fallback would run fla.
+    if _on("gdn", k) and fla_inplace is not None and _on_triton_inference(k, v, g, beta):
+        fla_inplace.gated_delta_rule_advance_inplace(k, v, g, beta, state, steps)
+        return
+    keep = (torch.arange(k.shape[1], device=k.device)[None] < steps[:, None]).float()[..., None]
+    state.copy_(gated_delta_rule_step(torch.zeros_like(k), k, v, g * keep, beta * keep.to(beta.dtype), initial_state=state)[1])
+
+
+def delta_gates(b, a, dt_bias, log_decay_rate, valid=None) -> tuple[torch.Tensor, torch.Tensor]:
+    if _on_triton_inference(b, a, dt_bias, log_decay_rate):
+        return triton_kernels.delta_gates(b, a, dt_bias, log_decay_rate, valid)
+    beta, g = b.sigmoid(), log_decay_rate * F.softplus(a.float() + dt_bias)
+    if valid is None:
+        return beta, g
+    kept = valid[..., None]
+    return beta * kept.to(beta.dtype), g * kept.float()
+
+
+def eager_conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, ext_out=None):
+    B, T, C = qkv.shape
+    ext = torch.cat((state, qkv.transpose(1, 2)), dim=-1, out=ext_out)
+    conv = F.silu(F.conv1d(ext, weight, groups=C)[..., -T:]).transpose(1, 2)
+    q, k, v = conv.split([key_dim, key_dim, value_dim], dim=-1)
+    k_heads, v_heads = key_dim // head_k_dim, value_dim // head_v_dim
+    q = q.reshape(B, T, k_heads, head_k_dim).repeat_interleave(v_heads // k_heads, dim=2)
+    k = k.reshape(B, T, k_heads, head_k_dim).repeat_interleave(v_heads // k_heads, dim=2)
+    return ext, q, k, v.reshape(B, T, v_heads, head_v_dim)
+
+
+def conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, ext_out=None):
+    if _on_triton_inference(qkv, state, weight):
+        return triton_kernels.conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, ext_out)
+    ext, q, k, v = eager_conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, ext_out)
+    return ext, q, k, v.contiguous()
+
+
+def rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail_start: int) -> torch.Tensor:
+    if _on_triton_inference(k, v, qm, km, vm) and k_cache.dtype == k.dtype:
+        return triton_kernels.rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail_start)
+    k_cache[rows, positions] = apply_rotary(k, cos_c, sin_c)
+    v_cache[rows, positions] = v
+    B, M = qm.shape[:2]
+    q = apply_rotary(qm, cos_m, sin_m)
+    k_cache[:B, tail_start:tail_start + M] = apply_rotary(km, cos_m, sin_m)
+    v_cache[:B, tail_start:tail_start + M] = vm
+    return q
+
+
+def decode_attention(q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
+    if _on_triton_inference(q, k_cache, v_cache) and triton_kernels.decode_attention_supported(q, k_cache, v_cache, mask):
+        return triton_kernels.decode_attention(q, k_cache, v_cache, mask, scale)
+    B, length = q.shape[0], mask.shape[-1]
+    keys, vals = k_cache[:B, :length], v_cache[:B, :length]
+    with sdpa_kernel(EFFICIENT):
+        return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
+                                              enable_gqa=q.shape[2] != k_cache.shape[2]).transpose(1, 2)
 
 
 class Cache:
@@ -423,9 +494,9 @@ class GatedDeltaNet(nn.Module):
 
         if isinstance(cache, StaticCache):
             if cache.decoding(T):
-                if _on("gdn", q) and _fla_recurrent_kernel is not None and not _needs_grad(q, k, v, g, beta):
-                    o = gated_delta_rule_step_inplace(q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous(),
-                                                      beta.contiguous(), cache.rec[self.layer_idx])
+                if _on("gdn", q) and fla_inplace is not None and not _needs_grad(q, k, v, g, beta):
+                    o = fla_inplace.gated_delta_rule_step_inplace(q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous(),
+                                                                  beta.contiguous(), cache.rec[self.layer_idx])
                 else:
                     o, state = gated_delta_rule_step(q, k, v, g, beta, initial_state=cache.rec[self.layer_idx], output_final_state=True)
                     cache.rec[self.layer_idx].copy_(state)

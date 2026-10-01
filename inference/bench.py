@@ -77,6 +77,7 @@ def main(argv: list[str] | None = None) -> None:
 
 @torch.no_grad()
 def compare_ar(engine: Engine, records, n: int, max_think: int) -> dict:
+    from inference.engine import GroupRow
     enc = engine.encoder
     n = min(n, len(records))
     if n == 0:
@@ -87,7 +88,7 @@ def compare_ar(engine: Engine, records, n: int, max_think: int) -> dict:
         prompt = enc.encode(enc.prompt_text(rec, q))
         remainder = enc.encode(enc.remainder_text(q))
         cap = max(0, min(max_think, engine.L - len(prompt) - len(remainder) - engine.K - engine.J - 2))
-        spec = engine.group(rec, [q], Options(max_think=max_think))[0].chain
+        spec = engine.group([GroupRow(rec, q, Options(max_think=max_think))])[0].chain
         ids = torch.tensor(prompt, device=engine.device)[None]
         ref = engine.base.generate(ids, max_new_tokens=cap, temperature=0.0, eos_token_id=engine.eos,
                                            logit_bias=engine.bias.float())[0, len(prompt):].tolist()
