@@ -79,7 +79,14 @@ python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafte
 
 On an M4 Pro, one question thinks at about 20 tokens per second, and a request without thinking takes 0.3 to 0.5 s.
 
-`--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay bf16 at every size, while CUDA also quantizes them above 256 rows. The weights then use 11.5 GB, and one question thinks at about 31 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
+`--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay unquantized at every size, as on CUDA. The weights then use 11.5 GB, and one question thinks at about 31 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
+
+[PostHog/jeeves-fp8](https://huggingface.co/PostHog/jeeves-fp8) holds the same FP8 weights already quantized, so the download is about half the size. They give the same outputs as `--precision fp8` on the bf16 weights:
+
+```bash
+hf download PostHog/jeeves-fp8 --local-dir jeeves-fp8
+python -m inference.serve --model jeeves-fp8 --drafter jeeves-fp8/drafter_k4.safetensors --precision fp8 --max-rows 4 --max-len 4096 --port 8009
+```
 
 `python -m model.metal_test` checks the Metal kernels against float64 and eager references, and on CUDA `python -m model.triton_kernels_test` checks the Triton rotary, delta-state advance and delta gates bit for bit against the eager and fla paths, and `python -m inference.cuda_test` checks the merged projections and the attention masks. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
 
@@ -89,6 +96,8 @@ Or fuse your own trained checkpoint into a standalone model and serve it with a 
 python export.py runs/cispo/final --out runs/fused
 python -m inference.serve --model runs/fused --drafter runs/drafter_k4/drafter.safetensors --port 8009
 ```
+
+`python export_fp8.py runs/fused --drafter runs/drafter_k4/drafter.safetensors --out runs/fused-fp8` writes the FP8 weights of an export and its drafters, in the format of PostHog/jeeves-fp8.
 
 Then send a request in Jev's format:
 
@@ -268,6 +277,7 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 | `trainer.py`, `train.py`                 | SFT, CISPO and drafter training                                                     |
 | `test.py`, `jevbench.py`, `calibrate.py` | evaluation, JevBench, temperature fitting                                           |
 | `export.py`                              | fuses LoRA into a standalone model with the head and temperature                    |
+| `export_fp8.py`                          | quantizes an exported model and its drafters to FP8 weights                         |
 | `drafter/`                               | drafter model, chain sampling, fused speculative decoder                            |
 | `inference/`                             | FP8 linears (CUDA, Metal), batched speculative engine, server and benchmark         |
 | `speed.py`                               | fixed speed and equivalence harness for MPS                                         |

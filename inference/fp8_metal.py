@@ -3,28 +3,35 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from inference.fp8_weights import FP8, quantize_rows, replace_linears
-from model import metal
-
-QUANTIZE_BLOCK_ROWS = 16384
+from drafter.view import DrafterView
+from inference.fp8_checkpoint import load_fp8_view
+from inference.fp8_weights import FP8, quantize_row_blocks_on_cpu
+from loader.dataloader import Encoder
+from model import PointerHead, metal
 
 
 class MetalFP8Linear(nn.Module):
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, device: torch.device | str | None = None):
         super().__init__()
-        weight, device = linear.weight.detach(), linear.weight.device
-        self.register_buffer("codes", torch.empty(weight.shape, dtype=torch.uint8, device=device))
-        self.register_buffer("scale", torch.empty(weight.shape[0], dtype=torch.float32, device=device))
-        # MPS in torch 2.14 has no float8 dtype, so the CPU makes the codes, in row blocks to bound its float copies of the weight.
-        for start in range(0, weight.shape[0], QUANTIZE_BLOCK_ROWS):
-            codes, scale = quantize_rows(weight[start:start + QUANTIZE_BLOCK_ROWS].cpu())
-            self.codes[start:start + len(scale)] = codes.view(torch.uint8).to(device)
-            self.scale[start:start + len(scale)] = scale.to(device)
-        self.bias = None if linear.bias is None else nn.Parameter(linear.bias.detach().to(torch.bfloat16), requires_grad=False)
-        self.in_features, self.out_features = linear.in_features, linear.out_features
+        # MPS in torch 2.14 has no float8 dtype, so the codes are kept as bytes and the CPU makes and tiles them.
+        self.register_buffer("tiled_codes", torch.empty(out_features, in_features, dtype=torch.uint8, device=device))
+        self.register_buffer("scale", torch.empty(out_features, dtype=torch.float32, device=device))
+        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16, device=device), requires_grad=False) if bias else None
+        self.in_features, self.out_features = in_features, out_features
+
+    @torch.no_grad()
+    def load_codes(self, codes: torch.Tensor, scale: torch.Tensor) -> None:
+        self.tiled_codes.copy_(metal.tile_fp8_codes(codes.view(torch.uint8)))
+        self.scale.copy_(scale)
+
+    @torch.no_grad()
+    def load_weight(self, weight: torch.Tensor) -> None:
+        for rows, codes, scale in quantize_row_blocks_on_cpu(weight):
+            self.tiled_codes[rows] = metal.tile_fp8_codes(codes.view(torch.uint8)).to(self.tiled_codes.device)
+            self.scale[rows] = scale.to(self.scale.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = metal.fp8_linear(x.to(torch.bfloat16), self.codes, self.scale)
+        y = metal.fp8_linear(x.to(torch.bfloat16), self.tiled_codes, self.scale)
         return y if self.bias is None else y + self.bias
 
 
@@ -33,18 +40,12 @@ def check_kernel_on_every_code(device: torch.device) -> None:
     codes = torch.arange(256, dtype=torch.uint8)
     finite = codes[~codes.view(FP8).float().isnan()]
     table = finite[(torch.arange(256)[:, None] + torch.arange(256)[None]) % len(finite)]
-    picked = metal.fp8_linear(torch.eye(256, dtype=torch.bfloat16, device=device), table.to(device), torch.ones(256, device=device))
+    picked = metal.fp8_linear(torch.eye(256, dtype=torch.bfloat16, device=device), metal.tile_fp8_codes(table).to(device),
+                              torch.ones(256, device=device))
     if not torch.equal(picked.cpu().float(), table.view(FP8).float().t()):
         raise RuntimeError("fp8_linear does not decode e4m3fn codes correctly on this GPU; use precision='bf16'")
 
 
-def quantize(module: nn.Module) -> int:
-    device = next(module.parameters()).device
+def load_view(model: str, drafter: str, block: int, device: torch.device) -> tuple[DrafterView, PointerHead, Encoder]:
     check_kernel_on_every_code(device)
-
-    def replace(linear: nn.Linear) -> nn.Module:
-        # Frees the bf16 weight of the layer replaced just before, so the allocator does not hold every old weight at once.
-        torch.mps.empty_cache()
-        return MetalFP8Linear(linear)
-
-    return replace_linears(module, replace)
+    return load_fp8_view(model, drafter, block, device, MetalFP8Linear)

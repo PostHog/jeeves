@@ -5,7 +5,11 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from inference.fp8_weights import quantize_rows, replace_linears
+from drafter.view import DrafterView
+from inference.fp8_checkpoint import load_fp8_view
+from inference.fp8_weights import FP8, quantize_rows
+from loader.dataloader import Encoder
+from model import PointerHead
 
 # Above this many rows, one conversion kernel for the activations costs less than converting them again in every program.
 CONVERT_IN_GEMM_M = 16
@@ -117,22 +121,28 @@ def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, split
 
 
 class FP8Linear(nn.Module):
-    def __init__(self, weight: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor | None):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, device: torch.device | str | None = None):
         super().__init__()
-        self.register_buffer("weight", weight)
-        self.register_buffer("scale", scale)
-        self.bias = None if bias is None else nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
-        self.out_features, self.in_features = weight.shape
+        self.register_buffer("weight", torch.empty(out_features, in_features, dtype=FP8, device=device))
+        self.register_buffer("scale", torch.empty(out_features, dtype=torch.float32, device=device))
+        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16, device=device), requires_grad=False) if bias else None
+        self.in_features, self.out_features = in_features, out_features
         self.split = split_for(self.out_features, self.in_features)
 
-    @classmethod
-    def quantized(cls, linear: nn.Linear) -> FP8Linear:
-        return cls(*quantize_rows(linear.weight), linear.bias)
+    @torch.no_grad()
+    def load_codes(self, codes: torch.Tensor, scale: torch.Tensor) -> None:
+        self.weight.copy_(codes)
+        self.scale.copy_(scale)
+
+    @torch.no_grad()
+    def load_weight(self, weight: torch.Tensor) -> None:
+        self.load_codes(*quantize_rows(weight.to(self.weight.device)))
 
     @classmethod
     def concatenated(cls, parts: list[FP8Linear]) -> FP8Linear:
-        merged = cls(torch.cat([p.weight for p in parts]), torch.cat([p.scale for p in parts]), None)
         sizes = [p.out_features for p in parts]
+        merged = cls(parts[0].in_features, sum(sizes), device="meta")
+        merged.weight, merged.scale = torch.cat([p.weight for p in parts]), torch.cat([p.scale for p in parts])
         for p, weight, scale in zip(parts, merged.weight.split(sizes), merged.scale.split(sizes)):
             p.weight, p.scale = weight, scale
         return merged
@@ -148,8 +158,10 @@ class FP8Linear(nn.Module):
         return y.view(*shape[:-1], self.out_features)
 
 
-def quantize(module: nn.Module) -> int:
-    return replace_linears(module, FP8Linear.quantized)
+def load_view(model: str, drafter: str, block: int, device: torch.device) -> tuple[DrafterView, PointerHead, Encoder]:
+    view, head, encoder = load_fp8_view(model, drafter, block, device, FP8Linear)
+    warm(view)
+    return view, head, encoder
 
 
 @torch.no_grad()

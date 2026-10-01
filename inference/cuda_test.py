@@ -13,6 +13,12 @@ from inference.fp8 import FP8Linear
 CUDA = torch.device("cuda")
 
 
+def quantized(linear: nn.Linear) -> FP8Linear:
+    fp8 = FP8Linear(linear.in_features, linear.out_features, device=linear.weight.device)
+    fp8.load_weight(linear.weight)
+    return fp8
+
+
 @torch.no_grad()
 def merges() -> list[str]:
     failures = []
@@ -28,7 +34,7 @@ def merges() -> list[str]:
         failures.append("the parts of a merged bf16 projection are not views of the merged weight")
     if merge_linears_in_place((nn.Linear(4096, 1024, device=CUDA), nn.Linear(4096, 1024, device=CUDA))) is not None:
         failures.append("merge_linears_in_place merged projections with a bias")
-    fp8_parts = [FP8Linear.quantized(nn.Linear(4096, n, bias=False, device=CUDA, dtype=torch.bfloat16)) for n in (4096, 1024, 1024)]
+    fp8_parts = [quantized(nn.Linear(4096, n, bias=False, device=CUDA, dtype=torch.bfloat16)) for n in (4096, 1024, 1024)]
     codes, scales = [p.weight.clone() for p in fp8_parts], [p.scale.clone() for p in fp8_parts]
     fp8_merged = merge_linears_in_place(tuple(fp8_parts))
     for p, c, s in zip(fp8_parts, codes, scales):
@@ -69,7 +75,7 @@ def fp8_matmuls() -> list[str]:
     failures = []
     torch.manual_seed(1)
     for N, K in ((4096, 4096), (1024, 12288)):
-        linear = FP8Linear.quantized(nn.Linear(K, N, bias=False, device=CUDA, dtype=torch.bfloat16))
+        linear = quantized(nn.Linear(K, N, bias=False, device=CUDA, dtype=torch.bfloat16))
         dequantized = linear.weight.float() * linear.scale[:, None]
         for M in (1, 4, 12, 16, 17, 48, 256, 300, 1024):
             x = torch.randn(M, K, device=CUDA, dtype=torch.bfloat16)
