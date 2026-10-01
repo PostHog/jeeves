@@ -79,9 +79,9 @@ python -m inference.serve --model jeeves-weights --drafter jeeves-weights/drafte
 
 On an M4 Pro, one question thinks at about 20 tokens per second, and a request without thinking takes 0.3 to 0.5 s.
 
-`--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay bf16 at every size, while CUDA also quantizes them above 256 rows. The weights then use 11.5 GB, and one question thinks at about 31 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
+`--precision fp8` quantizes the linear layers as on CUDA and runs them with a Metal w8a16 kernel. Activations stay bf16 at every size, while CUDA also quantizes them above 256 rows. The weights then use 11.5 GB, and one question thinks at about 38 tokens per second. The outputs change slightly; on dev questions, accuracy and NLL did not change measurably.
 
-[PostHog/jeeves-fp8](https://huggingface.co/PostHog/jeeves-fp8) holds the same FP8 weights already quantized, so the download is about half the size. They give the same outputs as `--precision fp8` on the bf16 weights:
+FP8 weights can be downloaded from [PostHog/jeeves-fp8](https://huggingface.co/PostHog/jeeves-fp8). They give the same outputs as `--precision fp8` on the bf16 weights:
 
 ```bash
 hf download PostHog/jeeves-fp8 --local-dir jeeves-fp8
