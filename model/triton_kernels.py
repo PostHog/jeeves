@@ -239,3 +239,54 @@ def rotate_into_cache(k: torch.Tensor, v: torch.Tensor, qm: torch.Tensor, km: to
                                         positions.contiguous(), tail_start, *rows.stride(), qm.stride(0), qm.stride(1), k_cache.stride(0),
                                         k_cache.stride(1), K=K, M=M, H=H, D=D, N_FREQS=n_freqs, BLOCK=triton.next_power_of_2(D))
     return q_out
+
+
+# Output t is silu(sum_i w[i] * ext[t + 1 + i]), where ext holds each channel's conv state and then its new rows, rounded like F.conv1d (a float32 sum in tap order, then bf16) and F.silu (expf and IEEE division, then bf16).
+@triton.jit
+def _conv_step(state, qkv, weight, ext, q_out, k_out, v_out, C, stride_qkv_b, stride_qkv_t, T: tl.constexpr, TAPS: tl.constexpr,
+               KEY_DIM: tl.constexpr, VALUE_DIM: tl.constexpr, DK: tl.constexpr, REP: tl.constexpr, BLOCK_C: tl.constexpr):
+    b = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    inside = c < C
+    ext_row = ext + (b * C + c) * (TAPS + T)
+    for i in tl.static_range(TAPS):
+        tl.store(ext_row + i, tl.load(state + (b * C + c) * TAPS + i, mask=inside, other=0.0), mask=inside)
+    for t in tl.static_range(T):
+        tl.store(ext_row + TAPS + t, tl.load(qkv + b * stride_qkv_b + t * stride_qkv_t + c, mask=inside, other=0.0), mask=inside)
+    is_q = c < KEY_DIM
+    is_k = (c >= KEY_DIM) & (c < 2 * KEY_DIM)
+    is_v = (c >= 2 * KEY_DIM) & inside
+    key_channel = tl.where(is_q, c, c - KEY_DIM)
+    head, d = key_channel // DK, key_channel % DK
+    for t in tl.static_range(T):
+        acc = tl.zeros([BLOCK_C], dtype=tl.float32)
+        for i in tl.static_range(TAPS):
+            tap = tl.load(weight + c * TAPS + i, mask=inside, other=0.0).to(tl.float32)
+            acc += tap * tl.load(ext_row + t + 1 + i, mask=inside, other=0.0).to(tl.float32)
+        x = _round_to_bf16(acc)
+        y = tl.math.div_rn(x, 1.0 + libdevice.exp(-x)).to(tl.bfloat16)
+        for r in tl.static_range(REP):
+            offset = ((b * T + t) * (KEY_DIM // DK) * REP + head * REP + r) * DK + d
+            tl.store(q_out + offset, y, mask=is_q)
+            tl.store(k_out + offset, y, mask=is_k)
+        tl.store(v_out + (b * T + t) * VALUE_DIM + (c - 2 * KEY_DIM), y, mask=is_v)
+
+
+def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int,
+              rep: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, T, C = qkv.shape
+    taps = state.shape[-1]
+    if qkv.stride(-1) != 1 or not state.is_contiguous() or not weight.is_contiguous() or C != 2 * key_dim + value_dim:
+        raise ValueError("qkv needs contiguous channels, state and weight must be contiguous, and qkv must hold q, k and v")
+    if state.shape != (B, C, taps) or weight.shape != (C, 1, taps) or any(t.dtype != torch.bfloat16 for t in (state, qkv, weight)):
+        raise ValueError(f"expected bfloat16 state of shape {(B, C, taps)} and weight of shape {(C, 1, taps)}, got {state.dtype} {tuple(state.shape)} "
+                         f"and {weight.dtype} {tuple(weight.shape)}")
+    ext = torch.empty(B, C, taps + T, dtype=qkv.dtype, device=qkv.device)
+    q = torch.empty(B, T, key_dim // head_k_dim * rep, head_k_dim, dtype=qkv.dtype, device=qkv.device)
+    k = torch.empty_like(q)
+    v = torch.empty(B, T, value_dim // head_v_dim, head_v_dim, dtype=qkv.dtype, device=qkv.device)
+    block_c = 512
+    _conv_step[(B, triton.cdiv(C, block_c))](state, qkv, weight, ext, q, k, v, C, qkv.stride(0), qkv.stride(1), T=T, TAPS=taps,
+                                            KEY_DIM=key_dim, VALUE_DIM=value_dim, DK=head_k_dim, REP=rep, BLOCK_C=block_c,
+                                            enable_reflect_ftz=False)
+    return ext, q, k, v

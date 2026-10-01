@@ -13,8 +13,8 @@ from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import (EFFICIENT, FrozenRMSNorm, RMSNorm, apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace,
-                         gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled, rotate_into_cache)
+from model.model import (EFFICIENT, FrozenRMSNorm, RMSNorm, apply_rotary, conv_step, decode_attention, delta_gates,
+                         gated_delta_rule_advance_inplace, gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled, rotate_into_cache)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
@@ -419,13 +419,8 @@ class Engine:
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
                 hc, hm = self.split_candidate_rows(h, K)
                 qkv, b_in, a_in = self.project(hc, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
-                ext = torch.cat((self.conv[i][:B], qkv.transpose(1, 2)), dim=-1)
-                conv = F.silu(F.conv1d(ext, lin.conv1d.weight, groups=lin.conv_dim)[..., -K:]).transpose(1, 2)
-                q, k, v = conv.split([lin.key_dim, lin.key_dim, lin.value_dim], dim=-1)
-                rep = lin.num_v_heads // lin.num_k_heads
-                q = q.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                k = k.reshape(B, K, lin.num_k_heads, lin.head_k_dim).repeat_interleave(rep, dim=2)
-                v = v.reshape(B, K, Hv, Dv).contiguous()
+                ext, q, k, v = conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, lin.key_dim, lin.value_dim, lin.head_k_dim, Dv,
+                                         Hv // lin.num_k_heads)
                 beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i])
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
                 pending[i] = (k, v, g, beta, ext)

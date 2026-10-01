@@ -4,7 +4,8 @@ import sys
 
 import torch
 
-from model.model import apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace, rotate_into_cache, set_kernels
+from model.model import (apply_rotary, conv_step, decode_attention, delta_gates, gated_delta_rule_advance_inplace, rotate_into_cache,
+                         set_kernels)
 
 CUDA = torch.device("cuda")
 BITS = {torch.float32: torch.int32, torch.bfloat16: torch.int16}
@@ -160,12 +161,29 @@ def cache_writes() -> list[str]:
     return failures
 
 
+@torch.no_grad()
+def conv_steps() -> list[str]:
+    failures = []
+    gen = torch.Generator().manual_seed(9)
+    key_dim, value_dim, head_dim, rep, taps = 2048, 4096, 128, 2, 4
+    C = 2 * key_dim + value_dim
+    for B, T in ((1, 4), (4, 4), (2, 8)):
+        merged = (torch.randn(B, T, C + 64, generator=gen) * 2).to(torch.bfloat16).to(CUDA)
+        state = torch.randn(B, C, taps, generator=gen).to(torch.bfloat16).to(CUDA)
+        weight = (torch.randn(C, 1, taps, generator=gen) * 0.5).to(torch.bfloat16).to(CUDA)
+        eager, out = eager_then_triton(lambda: conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim, rep))
+        for name, x, y in zip(("ext", "q", "k", "v"), out, eager):
+            if not same_bits(x, y):
+                failures.append(f"conv_step {(B, T)}: the Triton kernel's {name} is not bitwise equal to eager")
+    return failures
+
+
 def main() -> None:
     enabled = set_kernels(triton_inference=True, gdn=True)
     if not (enabled["triton_inference"] and enabled["gdn"]):
         print(f"the Triton and fla kernels are not available, so nothing can be checked: {enabled}")
         sys.exit(1)
-    failures = rotary() + delta_advance() + gates() + attention() + cache_writes()
+    failures = rotary() + delta_advance() + gates() + attention() + cache_writes() + conv_steps()
     print("\n".join(failures) if failures else "all checks passed")
     sys.exit(1 if failures else 0)
 
