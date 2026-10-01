@@ -17,7 +17,11 @@ from model import PointerHead
 CONVERT_IN_GEMM_M = 16
 # Above this many rows the row tiles alone fill the GPU, so passes skip split-K and use taller tiles that reuse each weight tile more.
 SPLIT_K_MAX_ROWS = 256
-TARGET_BLOCKS = 264
+# Each extra split costs a float32 partial and its reduction, so K is split only until there are this many programs per SM: in a sweep on an H100 PCIe (2026-10-01), more programs were slower and fewer left bandwidth unused.
+MIN_PROGRAMS_PER_SM = 1.5
+MIN_SPLIT_K = 1024
+# A deeper pipeline has a longer prologue, which only a long K loop pays back.
+DEEP_PIPELINE_STEPS = 32
 BLOCK_N, BLOCK_K = 64, 128
 TILE_COUNTER_SLOTS = 1 << 16
 ROW_CONVERT_BLOCK = 1024
@@ -98,17 +102,27 @@ TILE_COUNTERS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
 @lru_cache
-def split_for(N: int, K: int) -> int:
-    split = 1
-    while triton.cdiv(N, BLOCK_N) * split < TARGET_BLOCKS and K % (split * 2 * BLOCK_K) == 0 and K // (split * 2) >= 1024:
-        split *= 2
-    return split
+def sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@lru_cache
+def split_for(N: int, K: int, sms: int) -> int:
+    steps = K // BLOCK_K
+    splits = [s for s in range(1, steps + 1) if steps % s == 0 and K // s >= min(K, MIN_SPLIT_K)]
+    return next((s for s in splits if triton.cdiv(N, BLOCK_N) * s >= MIN_PROGRAMS_PER_SM * sms), splits[-1])
 
 
 def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     M, K = x.shape
     N = weight.shape[0]
-    block_m, split, stages = (128, 1, 3) if M > SPLIT_K_MAX_ROWS else (min(64, max(16, triton.next_power_of_2(M))), split_for(N, K), 4)
+    if K % BLOCK_K:
+        raise ValueError(f"the fp8 GEMM needs in_features divisible by {BLOCK_K}, got {K}")
+    if M > SPLIT_K_MAX_ROWS:
+        block_m, split, stages = 128, 1, 3
+    else:
+        block_m, split = min(64, max(16, triton.next_power_of_2(M))), split_for(N, K, sm_count(x.device))
+        stages = 4 if K // split // BLOCK_K >= DEEP_PIPELINE_STEPS else 3
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, block_m), split)
     counters = partial = None
     if split > 1:
