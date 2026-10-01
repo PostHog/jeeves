@@ -13,7 +13,7 @@ import torch
 from huggingface_hub import try_to_load_from_cache
 
 from inference.engine import Engine
-from inference.types import PRECISIONS, Options
+from inference.types import PRECISIONS, Options, Result
 from prep.format import DataFormat, read_jsonl
 
 RUNS = 6
@@ -42,10 +42,12 @@ def workload(records: list[DataFormat]) -> list[tuple[DataFormat, Options]]:
     return [(rec, Options(max_think=think[i]) if i in think else Options(think=False)) for i, rec in enumerate(sample)]
 
 
+def answer_all(engine: Engine, jobs: list[tuple[DataFormat, Options]], batch: bool) -> list[list[Result]]:
+    return engine.answer_batch(jobs) if batch else [engine.answer(rec, opts) for rec, opts in jobs]
+
+
 def run(engine: Engine, jobs: list[tuple[DataFormat, Options]], batch: bool = False) -> list[list[dict]]:
-    if batch:
-        return [[as_record(r) for r in results] for results in engine.answer_batch(jobs)]
-    return [[as_record(r) for r in engine.answer(rec, opts)] for rec, opts in jobs]
+    return [[as_record(r) for r in results] for results in answer_all(engine, jobs, batch)]
 
 
 def compare(outputs: list[list[dict]], reference: list[list[dict]]) -> dict:
@@ -81,14 +83,8 @@ def evaluate(engine: Engine, records: list[DataFormat], n: int, batch: bool = Fa
     chosen = random.Random(1).sample(records, n)
     rows, outputs = [], []
     t0 = time.perf_counter()
-    if batch:
-        nothinks = engine.answer_batch([(rec, Options(think=False)) for rec in chosen])
-        thinks = engine.answer_batch([(rec, Options(max_think=EVAL_MAX_THINK)) for rec in chosen])
-    else:
-        nothinks, thinks = [], []
-        for rec in chosen:
-            nothinks.append(engine.answer(rec, Options(think=False)))
-            thinks.append(engine.answer(rec, Options(max_think=EVAL_MAX_THINK)))
+    results = answer_all(engine, [(rec, opts) for rec in chosen for opts in (Options(think=False), Options(max_think=EVAL_MAX_THINK))], batch)
+    nothinks, thinks = results[::2], results[1::2]
     for rec, think, nothink in zip(chosen, thinks, nothinks):
         outputs.append([as_record(r) for r in think] + [as_record(r, thought=False) for r in nothink])
         for q, t, nt in zip(rec.questions, think, nothink):
@@ -112,7 +108,7 @@ def main() -> None:
     ap.add_argument("--precision", choices=PRECISIONS, default="bf16")
     ap.add_argument("--drafter", default="drafter_k4.safetensors", help="drafter file in the model snapshot")
     ap.add_argument("--block", type=int, default=4, help="the drafter's block size")
-    ap.add_argument("--batch", action="store_true", help="answer all requests together, in groups of up to MAX_ROWS questions, for throughput")
+    ap.add_argument("--batch", action="store_true", help=f"answer all requests together, in groups of up to {MAX_ROWS} questions, for throughput")
     a = ap.parse_args()
     model = a.model or default_snapshot()
     records = read_jsonl(a.data)
@@ -122,7 +118,7 @@ def main() -> None:
         summary, outputs = evaluate(engine, records, a.eval, a.batch)
     else:
         summary, outputs = speed(engine, records, a.batch)
-    summary["precision"] = engine.precision
+    summary |= {"precision": engine.precision, "drafter": a.drafter, "block": a.block, "batch": a.batch}
     summary["driver_gb"] = round(torch.mps.driver_allocated_memory() / 1e9, 1) if engine.device.type == "mps" else None
     if a.reference:
         summary.update(compare(outputs, json.loads(Path(a.reference).read_text())))

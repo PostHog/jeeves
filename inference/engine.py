@@ -1,24 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention import sdpa_kernel
 
 from export import load_export
 from inference.types import PRECISIONS, Options, Result
 from model.config import LINEAR
 from model import metal
-from model.model import (FrozenRMSNorm, RMSNorm, apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace,
+from model.model import (EFFICIENT, FrozenRMSNorm, RMSNorm, apply_rotary, decode_attention, delta_gates, gated_delta_rule_advance_inplace,
                          gated_delta_rule_chunk, gated_delta_rule_step, metal_enabled, rotate_into_cache)
 from drafter.view import DrafterView
 from prep.format import DataFormat, Question
 
-EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 # SDPA's efficient kernel pads a copy of any mask whose row stride is not aligned, in every call.
 MASK_ROW_ALIGNMENT = 16
 # Longer passes run eagerly at their exact length: there the GPU work outweighs the launch cost a graph removes, and padding would add to it.
@@ -78,6 +77,26 @@ def additive_mask(allowed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     padded = -(-allowed.shape[-1] // MASK_ROW_ALIGNMENT) * MASK_ROW_ALIGNMENT
     mask = torch.full((*allowed.shape[:-1], padded), float("-inf"), dtype=dtype, device=allowed.device)[..., :allowed.shape[-1]]
     return mask.masked_fill_(allowed, 0.0)
+
+
+class GroupRow(NamedTuple):
+    record: DataFormat
+    question: Question
+    options: Options
+
+
+def pack_requests(sizes: list[int], capacity: int) -> list[list[tuple[int, int]]]:
+    groups: list[list[tuple[int, int]]] = []
+    for request, size in enumerate(sizes):
+        questions = [(request, i) for i in range(size)]
+        for start in range(0, size, capacity):
+            part = questions[start:start + capacity]
+            group = next((g for g in groups if len(g) + len(part) <= capacity), None)
+            if group is None:
+                groups.append(part)
+            else:
+                group.extend(part)
+    return groups
 
 
 def common_prefix(seqs: list[list[int]]) -> int:
@@ -525,29 +544,32 @@ class Engine:
     def answer(self, record: DataFormat, opts: Options) -> list[Result]:
         return self.answer_batch([(record, opts)])[0]
 
+    @torch.no_grad()
     def answer_batch(self, jobs: list[tuple[DataFormat, Options]]) -> list[list[Result]]:
-        rows = [(job, record, question, opts) for job, (record, opts) in enumerate(jobs) for question in record.questions]
-        # Rows that think share groups, so that rows without thinking do not hold decode rows.
-        rows.sort(key=lambda row: row[3].think)
-        results: list[list[Result]] = [[] for _ in jobs]
-        for start in range(0, len(rows), self.R):
-            chunk = rows[start:start + self.R]
-            for (job, *_), result in zip(chunk, self.group([(record, question, opts) for _, record, question, opts in chunk])):
-                results[job].append(result)
+        results: list[list[Result | None]] = [[None] * len(record.questions) for record, _ in jobs]
+        # Thinking and no-think requests never share a group, so no-think rows hold no decode rows, and whole requests are packed together
+        # where they fit, so that a request's questions keep sharing their prompt prefix.
+        for thinking in (False, True):
+            requests = [job for job, (_, opts) in enumerate(jobs) if opts.think == thinking]
+            for group in pack_requests([len(jobs[job][0].questions) for job in requests], self.R):
+                rows = [GroupRow(jobs[requests[r]][0], jobs[requests[r]][0].questions[i], jobs[requests[r]][1]) for r, i in group]
+                for (r, i), result in zip(group, self.group(rows)):
+                    results[requests[r]][i] = result
         return results
 
-    def group(self, rows: list[tuple[DataFormat, Question, Options]]) -> list[Result]:
+    def group(self, rows: list[GroupRow]) -> list[Result]:
         enc = self.encoder
-        prompts = [enc.encode(enc.prompt_text(record, q)) for record, q, _ in rows]
-        rems = [enc.encode(enc.remainder_text(q)) for _, q, _ in rows]
+        prompts = [enc.encode(enc.prompt_text(row.record, row.question)) for row in rows]
+        rems = [enc.encode(enc.remainder_text(row.question)) for row in rows]
         B = len(rows)
         slack = self.K + self.J + 2
         for p, r in zip(prompts, rems):
             if len(p) + len(r) + len(self.empty_think) + slack > self.L:
                 raise ValueError(f"input of {len(p) + len(r)} tokens exceeds the {self.L}-token limit")
-        budgets = [opts.max_think if opts.think else 0 for *_, opts in rows]
-        thresholds = [opts.nothink_threshold for *_, opts in rows]
+        budgets = [row.options.max_think if row.options.think else 0 for row in rows]
+        thresholds = [row.options.nothink_threshold for row in rows]
         caps = [max(0, min(budget, self.L - len(p) - len(r) - slack)) for budget, p, r in zip(budgets, prompts, rems)]
+        wants_nothink = [t is not None or not c for t, c in zip(thresholds, caps)]
         P = common_prefix(prompts) if B > 1 else 0
         self.reset(self.decode_rows(B))
         if P > 0:
@@ -576,5 +598,6 @@ class Engine:
                 if caps[b]:
                     probs[b] = self.readout(hr[b], seqs[b])
         return [Result(probs=probs[b], thought=bool(caps[b]), chain=chains[b], closed=closed[b],
-                       nothink_probs=nothink[b] if nothink is not None else None, prompt_tokens=len(prompts[b]) - (P if b else 0))
+                       nothink_probs=nothink[b] if nothink is not None and wants_nothink[b] else None,
+                       prompt_tokens=len(prompts[b]) - (P if b else 0))
                 for b in range(B)]

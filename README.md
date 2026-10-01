@@ -88,7 +88,7 @@ hf download PostHog/jeeves-fp8 --local-dir jeeves-fp8
 python -m inference.serve --model jeeves-fp8 --drafter jeeves-fp8/drafter_k4.safetensors --precision fp8 --max-rows 4 --max-len 4096 --port 8009
 ```
 
-`python -m model.metal_test` checks the Metal kernels against float64 and eager references, and on CUDA `python -m model.triton_kernels_test` checks the Triton rotary, delta-state advance and delta gates bit for bit against the eager and fla paths, and `python -m inference.cuda_test` checks the merged projections and the attention masks. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
+`python -m model.metal_test` checks the Metal kernels against float64 and eager references. On CUDA, `python -m model.triton_kernels_test` checks the Triton rotary, delta-state advance, delta gates and cache writes bit for bit against the eager and fla paths, and the decode attention against float32. `python -m inference.cuda_test` checks the merged projections, the attention masks and the FP8 GEMM. `python -m inference.engine_test` checks how `answer_batch` packs requests into groups, on any device. `python speed.py --model jeeves-weights --data data/dev.jsonl` times a fixed set of dev requests; `python -m prep.prep` builds `data/`.
 
 Or fuse your own trained checkpoint into a standalone model and serve it with a drafter:
 

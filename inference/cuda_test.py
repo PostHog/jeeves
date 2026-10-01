@@ -74,17 +74,20 @@ def masks() -> list[str]:
 def fp8_matmuls() -> list[str]:
     failures = []
     torch.manual_seed(1)
-    for N, K in ((4096, 4096), (1024, 12288)):
+    # 1040 columns are not a multiple of BLOCK_N, and 17408 columns fill the GPU without split-K.
+    for N, K in ((4096, 4096), (1024, 12288), (1040, 4096), (17408, 4096)):
         linear = quantized(nn.Linear(K, N, bias=False, device=CUDA, dtype=torch.bfloat16))
         dequantized = linear.weight.float() * linear.scale[:, None]
         for M in (1, 4, 12, 16, 17, 48, 256, 300, 1024):
             x = torch.randn(M, K, device=CUDA, dtype=torch.bfloat16)
-            x[:, 0] = 1e5
+            # An outlier dominates its row's outputs, so only rows without one show errors in the rest of the GEMM, and tiny rows fall into fp16's subnormals unless scaled up.
+            x[::2, 0] = 1e5
+            x[1::4] *= 2 ** -20
             reference = x.float() @ dequantized.t()
             out = linear(x)
-            error = ((out.float() - reference).norm() / reference.norm()).item()
-            if not error <= 4e-3:
-                failures.append(f"FP8Linear {N}x{K} at {M} rows differs from float32 by {error:.2e}, more than bf16 rounding")
+            error = (out.float() - reference).norm(dim=1) / reference.norm(dim=1)
+            if not out.isfinite().all() or not error.max() <= 2e-3:
+                failures.append(f"FP8Linear {N}x{K} at {M} rows differs from float32 by up to {error.max():.2e} in a row, more than bf16 rounding")
             if not torch.equal(out, linear(x)):
                 failures.append(f"FP8Linear {N}x{K} at {M} rows gives different results on a second call")
     return failures

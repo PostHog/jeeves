@@ -599,8 +599,8 @@ def chunked_cached_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: to
     return out
 
 
-# FP8 linear (w8a16): y = x @ (codes * scale).T with float accumulation and one rounding to bf16, the math of inference/fp8.py's
-# w8a16 kernel. A simdgroup owns FP8_TILE_FEATURES output features and FP8_TILE_ROWS rows of x. The kernel's layout fixes these three
+# FP8 linear (w8a16): y = x @ (codes * scale).T with float accumulation and one rounding to bf16, the math of _fp8_matmul in
+# inference/fp8.py. A simdgroup owns FP8_TILE_FEATURES output features and FP8_TILE_ROWS rows of x. The kernel's layout fixes these three
 # sizes: two simdgroup_float8x8 accumulators, and 16-byte code loads by the 4 lanes that share a fragment row.
 
 FP8_TILE_FEATURES = 16

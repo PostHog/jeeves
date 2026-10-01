@@ -103,23 +103,30 @@ def gates() -> list[str]:
 def attention() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(7)
-    candidates, mask_rows = 4, 12
-    for B, skip, H, Hkv, D, Lw in ((1, 0, 16, 4, 256, 512), (3, 0, 16, 4, 256, 1024), (2, 4, 32, 32, 128, 2048), (4, 4, 32, 32, 128, 512)):
-        L, R = Lw + mask_rows, candidates + mask_rows - skip
+    K, J = 4, 3
+    M = K * J
+    block_of_mask = torch.arange(K).repeat_interleave(J)
+    # Like the engine's decode masks: row t < K sees the cache up to n + t, and a mask row of block j sees the cache up to n + j and its block's tail keys, so whole slices of keys are masked.
+    limit_offset = torch.cat((torch.arange(K), block_of_mask))
+    allow_tail = torch.cat((torch.full((K,), -1), block_of_mask))[:, None] == block_of_mask[None, :]
+    for B, first_row, H, Hkv, D, Lw in ((1, 0, 16, 4, 256, 512), (3, 0, 16, 4, 256, 1024), (2, K, 32, 32, 128, 2048), (4, K, 32, 32, 128, 512)):
+        L, R = Lw + M, K + M - first_row
         q = torch.randn(B, R, H, D, generator=gen).to(torch.bfloat16).to(CUDA)
         k_cache, v_cache = (torch.randn(8, L + 1, Hkv, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2))
-        allowed = torch.rand(B, 1, R, L, generator=gen) < 0.5
-        allowed[..., 0] = True
-        for mask in (torch.zeros(B, 1, R, L + 4)[..., :L], torch.zeros(B, 1, R, L)):
-            mask = mask.masked_fill(~allowed, float("-inf")).to(torch.bfloat16).to(CUDA)
-            eager, out = eager_then_triton(lambda: decode_attention(q, k_cache, v_cache, mask, D ** -0.5))
-            keys, values = (t[:B, :L].float().repeat_interleave(H // Hkv, dim=2) for t in (k_cache, v_cache))
-            scores = torch.einsum("brhd,blhd->bhrl", q.float(), keys) * D ** -0.5 + mask.float()
-            reference = torch.einsum("bhrl,blhd->brhd", scores.softmax(-1), values)
-            error, eager_error = (out.float() - reference).abs(), (eager.float() - reference).abs()
-            if out.isnan().any() or error.mean() > 1.25 * eager_error.mean() or error.max() > 2 * eager_error.max():
-                failures.append(f"decode_attention {(B, R, H, Hkv, D, L)}: the Triton kernel's error against float32 (mean {error.mean():.2e}, "
-                                f"max {error.max():.2e}) is above SDPA's (mean {eager_error.mean():.2e}, max {eager_error.max():.2e})")
+        n = torch.randint(0, Lw - K, (B,), generator=gen)
+        n[0] = 0
+        allow_cache = torch.arange(Lw)[None, None] <= (n[:, None] + limit_offset[None])[..., None]
+        allowed = torch.cat((allow_cache, allow_tail[None].expand(B, -1, -1)), dim=2)[:, None].to(CUDA)
+        padded = torch.full((B, 1, K + M, L + 4), float("-inf"), dtype=torch.bfloat16, device=CUDA)[..., :L]
+        mask = padded.masked_fill_(allowed, 0.0)[:, :, first_row:]
+        eager, out = eager_then_triton(lambda: decode_attention(q, k_cache, v_cache, mask, D ** -0.5))
+        keys, values = (t[:B, :L].float().repeat_interleave(H // Hkv, dim=2) for t in (k_cache, v_cache))
+        scores = torch.einsum("brhd,blhd->bhrl", q.float(), keys) * D ** -0.5 + mask.float()
+        reference = torch.einsum("bhrl,blhd->brhd", scores.softmax(-1), values)
+        error, eager_error = (out.float() - reference).abs(), (eager.float() - reference).abs()
+        if out.isnan().any() or error.mean() > 1.25 * eager_error.mean() or error.max() > 2 * eager_error.max():
+            failures.append(f"decode_attention {(B, R, H, Hkv, D, L)}: the Triton kernel's error against float32 (mean {error.mean():.2e}, "
+                            f"max {error.max():.2e}) is above SDPA's (mean {eager_error.mean():.2e}, max {eager_error.max():.2e})")
     return failures
 
 
@@ -127,26 +134,29 @@ def attention() -> list[str]:
 def cache_writes() -> list[str]:
     failures = []
     gen = torch.Generator().manual_seed(8)
-    H, D, n_freqs, slots, tail = 32, 128, 32, 700, 512
+    H, D, n_freqs, slots, tail_start = 32, 128, 32, 700, 512
     for B, K in ((1, 4), (4, 4), (2, 8)):
         M = K * (K - 1)
         k, v = (torch.randn(B, K, H, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2))
         merged = torch.randn(B, M, 3 * H * D + 8, generator=gen).to(torch.bfloat16).to(CUDA)
         qm, km, vm = (merged[..., i * H * D:(i + 1) * H * D].view(B, M, H, D) for i in range(3))
-        positions = (torch.randint(0, tail - K, (B, 1), generator=gen) + torch.arange(K)[None]).to(CUDA)
+        positions = (torch.randint(0, tail_start - K, (B, 1), generator=gen) + torch.arange(K)[None]).to(CUDA)
         freqs = torch.rand(B, K + M, 1, generator=gen) * 4000 * torch.logspace(0, -7, n_freqs)
         cos, sin = freqs.cos().to(CUDA), freqs.sin().to(CUDA)
-        rows = torch.arange(B, device=CUDA)[:, None].expand(B, K)
         caches = [torch.randn(8, slots, H, D, generator=gen).to(torch.bfloat16).to(CUDA) for _ in range(2)]
-
-        def written() -> tuple[torch.Tensor, ...]:
-            k_cache, v_cache = (c.clone() for c in caches)
-            q = rotate_into_cache(k, v, qm, km, vm, cos[:, :K], sin[:, :K], cos[:, K:], sin[:, K:], k_cache, v_cache, rows, positions, tail)
-            return q, k_cache, v_cache
-        eager, out = eager_then_triton(written)
-        for name, x, y in zip(("queries", "key cache", "value cache"), out, eager):
-            if not same_bits(x, y):
-                failures.append(f"rotate_into_cache {(B, K)}: the Triton kernel's {name} is not bitwise equal to eager")
+        in_order = torch.arange(B, device=CUDA)[:, None].expand(B, K)
+        shuffled = torch.randperm(8, generator=gen)[:B].to(CUDA)[:, None].expand(B, K)
+        for rows, cos_rows in ((in_order, B), (shuffled, 1)):
+            def written() -> tuple[torch.Tensor, ...]:
+                k_cache, v_cache = (c.clone() for c in caches)
+                c, s = cos[:cos_rows], sin[:cos_rows]
+                q = rotate_into_cache(k, v, qm, km, vm, c[:, :K], s[:, :K], c[:, K:], s[:, K:], k_cache, v_cache, rows, positions, tail_start)
+                return q, k_cache, v_cache
+            eager, out = eager_then_triton(written)
+            for name, x, y in zip(("queries", "key cache", "value cache"), out, eager):
+                if not same_bits(x, y):
+                    failures.append(f"rotate_into_cache {(B, K)} with cache rows {rows[:, 0].tolist()} and cos for {cos_rows} rows: the Triton "
+                                    f"kernel's {name} is not bitwise equal to eager")
     return failures
 
 

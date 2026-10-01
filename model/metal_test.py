@@ -210,12 +210,12 @@ def fp8() -> list[str]:
     for shape, K, N in (((1,), 256, 16), ((3,), 4096, 1024), ((12,), 4096, 4096), ((2, 8), 12288, 4096), ((37,), 4096, 8192), ((300,), 1024, 2048)):
         w8, scale = quantize_rows(torch.randn(N, K, generator=gen) * 0.02)
         x = torch.randn(*shape, K, generator=gen).to(torch.bfloat16)
-        triton_w8a16_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
+        fp8_matmul_math = ((x.float() @ w8.float().t()) * scale).to(torch.bfloat16)
         out = metal.fp8_linear(x.to(MPS), metal.tile_fp8_codes(w8.view(torch.uint8)).to(MPS), scale.to(MPS)).cpu()
         weights = w8.double() * scale.double()[:, None]
         exact, magnitude = x.double() @ weights.t(), x.double().abs() @ weights.abs().t()
-        equal = (out == triton_w8a16_math).float().mean().item()
-        print(f"fp8_linear x {tuple(x.shape)} K={K} N={N}: bitwise equal to the w8a16 math of inference/fp8.py {equal:.5f}")
+        equal = (out == fp8_matmul_math).float().mean().item()
+        print(f"fp8_linear x {tuple(x.shape)} K={K} N={N}: bitwise equal to the math of _fp8_matmul in inference/fp8.py {equal:.5f}")
         # Half a bf16 rounding plus room for float accumulation, which dominates only where the terms cancel.
         if equal < 0.999 or ((out.double() - exact).abs() > exact.abs() * 2 ** -8 + magnitude * 2 ** -20).any():
             failures.append(f"fp8_linear x {tuple(x.shape)} K={K} N={N} is further from float64 than one bf16 rounding and float accumulation")

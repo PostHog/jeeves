@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import torch.nn as nn
 import triton
@@ -13,16 +15,23 @@ from model import PointerHead
 
 # Above this many rows, one conversion kernel for the activations costs less than converting them again in every program.
 CONVERT_IN_GEMM_M = 16
+# Above this many rows the row tiles alone fill the GPU, so passes skip split-K and use taller tiles that reuse each weight tile more.
+SPLIT_K_MAX_ROWS = 256
 TARGET_BLOCKS = 264
 BLOCK_N, BLOCK_K = 64, 128
+TILE_COUNTER_SLOTS = 1 << 16
+ROW_CONVERT_BLOCK = 1024
+# The power of two puts each row's largest value in [2^13, 2^14), so no input, even float32, can overflow fp16's 65504, and bf16 values down to 2^-27 times the largest stay exact.
+FP16_TOP_EXPONENT = tl.constexpr(13)
+# One row count for each variant of _fp8_matmul that Triton compiles: tile heights 16, 32, 64 and 128, each with a row count that is and is not a multiple of 16.
+WARM_ROWS = (8, 16, 24, 32, 56, 64, SPLIT_K_MAX_ROWS + 8, SPLIT_K_MAX_ROWS + 16)
 
 
-# Hopper's tensor cores multiply fp8 only by fp8, so the weights go to fp16, which holds every e4m3 value exactly and takes one conversion
-# instruction (bf16 takes several). Activations go to fp16 after a power of two that keeps them inside its range, which is also exact.
+# Hopper's tensor cores multiply fp8 only by fp8, so the weights go to fp16, which holds every e4m3 value exactly and takes one conversion instruction (bf16 takes several).
 @triton.jit
 def _fp16_shift(amax):
     exponent = ((amax.to(tl.uint32, bitcast=True) >> 23) & 0xFF).to(tl.int32) - 127
-    return tl.maximum(exponent - 13, 0)
+    return tl.maximum(exponent - FP16_TOP_EXPONENT, -126)
 
 
 @triton.jit
@@ -45,14 +54,13 @@ def _fp16_rows(x, xh, row_scale, K, stride_xm, BLOCK: tl.constexpr):
     tl.store(row_scale + row, _power_of_two(shift))
 
 
-# Split-K runs in one launch: the last program to finish a tile adds the float32 partials in split order, so results do not depend on
-# scheduling, and resets the tile's counter for the next launch.
+# Split-K runs in one launch: the last program to finish a tile adds the float32 partials in split order, so results do not depend on scheduling, and resets the tile's counter for the next launch.
 @triton.jit
 def _fp8_matmul(x, row_scale, w, w_scale, y, partial, counters, M, N, K, stride_xm, stride_wn, stride_ym, k_per_split, SPLIT: tl.constexpr,
                 BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, CONVERT: tl.constexpr):
     pid_n, pid_m, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rk = tl.arange(0, BLOCK_K)
     acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     k_start = split * k_per_split
@@ -75,18 +83,21 @@ def _fp8_matmul(x, row_scale, w, w_scale, y, partial, counters, M, N, K, stride_
     else:
         tile = pid_m * tl.num_programs(0) + pid_n
         offsets = rm[None, :] * N + rn[:, None]
-        tl.store(partial + split * M * N + offsets, acc, mask=out_mask)
+        tl.store(partial + split.to(tl.int64) * M * N + offsets, acc, mask=out_mask)
+        # Triton 3.8 runs a scalar atomic in one thread and puts no barrier before a release, so without this another warp's partial could still be in flight.
+        tl.debug_barrier()
         if tl.atomic_add(counters + tile, 1, sem="acq_rel") == SPLIT - 1:
             total = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
             for part in range(SPLIT):
-                total += tl.load(partial + part * M * N + offsets, mask=out_mask, other=0.0, cache_modifier=".cg")
+                total += tl.load(partial + part.to(tl.int64) * M * N + offsets, mask=out_mask, other=0.0, cache_modifier=".cg")
             tl.store(y + rm[None, :] * stride_ym + rn[:, None], (total * w_s[:, None]).to(tl.bfloat16), mask=out_mask)
             tl.store(counters + tile, 0)
 
 
-TILE_COUNTERS: dict[torch.device, torch.Tensor] = {}
+TILE_COUNTERS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
+@lru_cache
 def split_for(N: int, K: int) -> int:
     split = 1
     while triton.cdiv(N, BLOCK_N) * split < TARGET_BLOCKS and K % (split * 2 * BLOCK_K) == 0 and K // (split * 2) >= 1024:
@@ -94,26 +105,29 @@ def split_for(N: int, K: int) -> int:
     return split
 
 
-def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, split: int) -> torch.Tensor:
+def fp8_matmul(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     M, K = x.shape
     N = weight.shape[0]
-    # Prefill-sized passes have enough row tiles to fill the GPU without split-K, and larger tiles reuse each weight tile more.
-    block_m, split, stages = (128, 1, 3) if M > 256 else (min(64, max(16, triton.next_power_of_2(M))), split, 4)
+    block_m, split, stages = (128, 1, 3) if M > SPLIT_K_MAX_ROWS else (min(64, max(16, triton.next_power_of_2(M))), split_for(N, K), 4)
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(M, block_m), split)
-    counters = TILE_COUNTERS.get(x.device)
-    if counters is None:
-        counters = TILE_COUNTERS[x.device] = torch.zeros(1 << 16, dtype=torch.int32, device=x.device)
-    if split > 1 and grid[0] * grid[1] > counters.numel():
-        raise ValueError(f"{grid[0] * grid[1]} tiles exceed the {counters.numel()} tile counters")
+    counters = partial = None
+    if split > 1:
+        # Launches on one stream run in order, but launches on different streams can overlap, and overlapping launches must not share tile counters.
+        key = (x.device, torch.cuda.current_stream(x.device).cuda_stream)
+        counters = TILE_COUNTERS.get(key)
+        if counters is None:
+            counters = TILE_COUNTERS[key] = torch.zeros(TILE_COUNTER_SLOTS, dtype=torch.int32, device=x.device)
+        if grid[0] * grid[1] > counters.numel():
+            raise ValueError(f"{grid[0] * grid[1]} tiles exceed the {counters.numel()} tile counters")
+        partial = torch.empty(split, M, N, device=x.device, dtype=torch.float32)
     y = torch.empty(M, N, device=x.device, dtype=torch.bfloat16)
-    partial = torch.empty(split, M, N, device=x.device, dtype=torch.float32) if split > 1 else y
     convert = M <= CONVERT_IN_GEMM_M
     if convert:
-        source, row_scale = x, y
+        source, row_scale = x, None
     else:
         source = torch.empty(M, K, device=x.device, dtype=torch.float16)
         row_scale = torch.empty(M, device=x.device, dtype=torch.float32)
-        _fp16_rows[(M,)](x, source, row_scale, K, x.stride(0), BLOCK=1024)
+        _fp16_rows[(M,)](x, source, row_scale, K, x.stride(0), BLOCK=ROW_CONVERT_BLOCK)
     _fp8_matmul[grid](source, row_scale, weight, scale, y, partial, counters, M, N, K, source.stride(0), weight.stride(0), y.stride(0),
                       K // split, SPLIT=split, BLOCK_N=BLOCK_N, BLOCK_M=block_m, BLOCK_K=BLOCK_K, CONVERT=convert, num_warps=4,
                       num_stages=stages)
@@ -127,7 +141,6 @@ class FP8Linear(nn.Module):
         self.register_buffer("scale", torch.empty(out_features, dtype=torch.float32, device=device))
         self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16, device=device), requires_grad=False) if bias else None
         self.in_features, self.out_features = in_features, out_features
-        self.split = split_for(self.out_features, self.in_features)
 
     @torch.no_grad()
     def load_codes(self, codes: torch.Tensor, scale: torch.Tensor) -> None:
@@ -152,7 +165,7 @@ class FP8Linear(nn.Module):
         x2 = x.reshape(-1, shape[-1]).to(torch.bfloat16)
         if x2.stride(-1) != 1:
             x2 = x2.contiguous()
-        y = fp8_matmul(x2, self.weight, self.scale, self.split)
+        y = fp8_matmul(x2, self.weight, self.scale)
         if self.bias is not None:
             y = y + self.bias
         return y.view(*shape[:-1], self.out_features)
@@ -171,6 +184,6 @@ def warm(module: nn.Module) -> int:
         if isinstance(m, FP8Linear) and (m.out_features, m.in_features) not in seen:
             seen.add((m.out_features, m.in_features))
             w = m.weight
-            for rows in (4, 12, 16, 32, 64, 128, 256, 512):
+            for rows in WARM_ROWS:
                 m(torch.zeros(rows, m.in_features, device=w.device, dtype=torch.bfloat16))
     return len(seen)

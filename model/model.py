@@ -75,6 +75,7 @@ _AVAILABLE = {
 }
 _ENABLED_BY_ENV = os.environ.get("QWEN35_KERNELS", "1") not in ("0", "false", "False")
 KERNELS = {k: v and _ENABLED_BY_ENV for k, v in _AVAILABLE.items()}
+EFFICIENT = [SDPBackend.EFFICIENT_ATTENTION]
 
 
 def set_kernels(**flags: bool) -> dict[str, bool]:
@@ -320,26 +321,26 @@ def delta_gates(b, a, dt_bias, log_decay_rate, valid=None) -> tuple[torch.Tensor
     return beta * kept.to(beta.dtype), g * kept.float()
 
 
-def rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail: int) -> torch.Tensor:
+def rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail_start: int) -> torch.Tensor:
     if _on_triton_inference(k, v, qm, km, vm) and k_cache.dtype == k.dtype:
-        return triton_kernels.rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, positions, tail)
+        return triton_kernels.rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, k_cache, v_cache, rows, positions, tail_start)
     k_cache[rows, positions] = apply_rotary(k, cos_c, sin_c)
     v_cache[rows, positions] = v
     B, M = qm.shape[:2]
     q = apply_rotary(qm, cos_m, sin_m)
-    k_cache[:B, tail:tail + M] = apply_rotary(km, cos_m, sin_m)
-    v_cache[:B, tail:tail + M] = vm
+    k_cache[:B, tail_start:tail_start + M] = apply_rotary(km, cos_m, sin_m)
+    v_cache[:B, tail_start:tail_start + M] = vm
     return q
 
 
 def decode_attention(q, k_cache, v_cache, mask, scale: float) -> torch.Tensor:
-    B, length, gqa = q.shape[0], mask.shape[-1], q.shape[2] != k_cache.shape[2]
-    if _on_triton_inference(q, k_cache, v_cache) and mask.dtype == q.dtype and q.shape[1] * (q.shape[2] // k_cache.shape[2]) <= 64:
+    if _on_triton_inference(q, k_cache, v_cache) and triton_kernels.decode_attention_supported(q, k_cache, v_cache, mask):
         return triton_kernels.decode_attention(q, k_cache, v_cache, mask, scale)
+    B, length = q.shape[0], mask.shape[-1]
     keys, vals = k_cache[:B, :length], v_cache[:B, :length]
-    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+    with sdpa_kernel(EFFICIENT):
         return F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), vals.transpose(1, 2), attn_mask=mask, scale=scale,
-                                              enable_gqa=gqa).transpose(1, 2)
+                                              enable_gqa=q.shape[2] != k_cache.shape[2]).transpose(1, 2)
 
 
 class Cache:
