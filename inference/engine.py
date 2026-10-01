@@ -187,12 +187,19 @@ class Engine:
         self.mask_embed = view.mask_embed.detach().to(self.dtype)
         self.layers = base.model.layers
         self.k, self.v, self.dk, self.dv, self.conv, self.rec = {}, {}, {}, {}, {}, {}
+        delta = [layer.linear_attn for layer in self.layers if layer.layer_type == LINEAR]
+        conv_dim, conv_kernel = delta[0].conv_dim, delta[0].conv_kernel
+        # Every delta layer's conv state is a view of one buffer, and so is the conv input of a decode cycle, so that one gather commits them all.
+        self.conv_states = torch.zeros(len(delta), max_rows, conv_dim, conv_kernel, device=dev, dtype=self.dtype)
+        self.conv_inputs: dict[int, torch.Tensor] = {}
+        self.conv_slot: dict[int, int] = {}
         for i, layer in enumerate(self.layers):
             if layer.layer_type == LINEAR:
                 lin = layer.linear_attn
                 self.dk[i] = torch.zeros(max_rows, slots, lin.num_v_heads, lin.head_v_dim, device=dev, dtype=self.dtype)
                 self.dv[i] = torch.zeros_like(self.dk[i])
-                self.conv[i] = torch.zeros(max_rows, lin.conv_dim, lin.conv_kernel, device=dev, dtype=self.dtype)
+                self.conv_slot[i] = len(self.conv_slot)
+                self.conv[i] = self.conv_states[self.conv_slot[i]]
                 self.rec[i] = torch.zeros(max_rows, lin.num_v_heads, lin.head_k_dim, lin.head_v_dim, device=dev, dtype=torch.float32)
             else:
                 att = layer.self_attn
@@ -210,6 +217,8 @@ class Engine:
         # Tuned on an M4 Pro with torch 2.14: in FP8, a cycle of MANY_QUESTIONS or more is compute-bound, so block 2's 4 rows per question
         # beat block 4's 16 rows even though block 2 accepts fewer tokens. In bf16 they do not, because MPS's bf16 matmul is slow at 9 to 15 rows.
         self.many_questions_block = decode_block(2, dev) if self.mps and fp8 and K > 2 else self.block
+        for block_K in {self.block.K, self.many_questions_block.K}:
+            self.conv_inputs[block_K] = torch.empty(len(delta), max_rows, conv_dim, conv_kernel + block_K, device=dev, dtype=self.dtype)
         self.cycle_graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.extend_graphs: dict[tuple[int, int, int, bool], torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle() if self.cuda else None
@@ -419,11 +428,11 @@ class Engine:
                 Hv, Dv = lin.num_v_heads, lin.head_v_dim
                 hc, hm = self.split_candidate_rows(h, K)
                 qkv, b_in, a_in = self.project(hc, lin.in_proj_qkv, lin.in_proj_b, lin.in_proj_a)
-                ext, q, k, v = conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, lin.key_dim, lin.value_dim, lin.head_k_dim, Dv,
-                                         Hv // lin.num_k_heads)
+                _, q, k, v = conv_step(self.conv[i][:B], qkv, lin.conv1d.weight, lin.key_dim, lin.value_dim, lin.head_k_dim, Dv,
+                                       Hv // lin.num_k_heads, ext_out=self.conv_inputs[K][self.conv_slot[i], :B])
                 beta, g = delta_gates(b_in, a_in, lin.dt_bias, self.log_decay_rates[i])
                 o_c = self.delta_outputs(q, k, v, g, beta, self.rec[i][:B])
-                pending[i] = (k, v, g, beta, ext)
+                pending[i] = (k, v, g, beta)
                 qm, km, vm = (t.view(B, M, Hv, Dv) for t in self.project(hm, view.delta_q[key], view.delta_k[key], view.delta_v[key]))
                 qm = rotate_into_cache(k, v, qm, km, vm, cos_c, sin_c, cos_m, sin_m, self.dk[i], self.dv[i], rows, pos_c, Lw)
                 o_m = self.cached_attention(qm, self.dk[i], self.dv[i], mask[:, :, K:], Dv ** -0.5, used_end, Lw)
@@ -462,10 +471,10 @@ class Engine:
         jm1 = (j - 1).clamp(min=0)
         nxt = torch.cat((pred.gather(1, jm1[:, None]), am.gather(1, K + jm1[:, None] * J + block.ar_j[None])), dim=1)
         self.out[:B].scatter_(1, self.n_out[:B, None] + block.ar_k[None], cand)
-        conv_columns = (j[:, None] + self.ar_conv_kernel[None])[:, None, :]
-        for i, (k, v, g, beta, ext) in pending.items():
+        for i, (k, v, g, beta) in pending.items():
             self.delta_commit(k, v, g, beta, self.rec[i][:B], j)
-            torch.gather(ext, 2, conv_columns.expand(B, ext.shape[1], -1), out=self.conv[i][:B])
+        conv_columns = (j[:, None] + self.ar_conv_kernel[None])[None, :, None, :]
+        torch.gather(self.conv_inputs[K][:, :B], 3, conv_columns.expand(*self.conv_states[:, :B].shape), out=self.conv_states[:, :B])
         cand.copy_(torch.where(done[:, None], cand, nxt))
         done.logical_or_((first_eos < j) | (self.n_out[:B] + j >= self.cap[:B]))
         n.add_(j)

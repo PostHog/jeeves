@@ -273,7 +273,7 @@ def _conv_step(state, qkv, weight, ext, q_out, k_out, v_out, C, stride_qkv_b, st
 
 
 def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int,
-              rep: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+              rep: int, ext_out: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, C = qkv.shape
     taps = state.shape[-1]
     if qkv.stride(-1) != 1 or not state.is_contiguous() or not weight.is_contiguous() or C != 2 * key_dim + value_dim:
@@ -281,7 +281,9 @@ def conv_step(state: torch.Tensor, qkv: torch.Tensor, weight: torch.Tensor, key_
     if state.shape != (B, C, taps) or weight.shape != (C, 1, taps) or any(t.dtype != torch.bfloat16 for t in (state, qkv, weight)):
         raise ValueError(f"expected bfloat16 state of shape {(B, C, taps)} and weight of shape {(C, 1, taps)}, got {state.dtype} {tuple(state.shape)} "
                          f"and {weight.dtype} {tuple(weight.shape)}")
-    ext = torch.empty(B, C, taps + T, dtype=qkv.dtype, device=qkv.device)
+    ext = torch.empty(B, C, taps + T, dtype=qkv.dtype, device=qkv.device) if ext_out is None else ext_out
+    if ext.shape != (B, C, taps + T) or ext.dtype != torch.bfloat16 or not ext.is_contiguous():
+        raise ValueError(f"ext_out: expected a contiguous bfloat16 tensor of shape {(B, C, taps + T)}, got {ext.dtype} {tuple(ext.shape)}")
     q = torch.empty(B, T, key_dim // head_k_dim * rep, head_k_dim, dtype=qkv.dtype, device=qkv.device)
     k = torch.empty_like(q)
     v = torch.empty(B, T, value_dim // head_v_dim, head_v_dim, dtype=qkv.dtype, device=qkv.device)

@@ -321,11 +321,11 @@ def delta_gates(b, a, dt_bias, log_decay_rate, valid=None) -> tuple[torch.Tensor
     return beta * kept.to(beta.dtype), g * kept.float()
 
 
-def conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, rep: int):
+def conv_step(state, qkv, weight, key_dim: int, value_dim: int, head_k_dim: int, head_v_dim: int, rep: int, ext_out=None):
     if _on_triton_inference(qkv, state, weight):
-        return triton_kernels.conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, rep)
+        return triton_kernels.conv_step(state, qkv, weight, key_dim, value_dim, head_k_dim, head_v_dim, rep, ext_out)
     B, T, C = qkv.shape
-    ext = torch.cat((state, qkv.transpose(1, 2)), dim=-1)
+    ext = torch.cat((state, qkv.transpose(1, 2)), dim=-1, out=ext_out)
     conv = F.silu(F.conv1d(ext, weight, groups=C)[..., -T:]).transpose(1, 2)
     q, k, v = conv.split([key_dim, key_dim, value_dim], dim=-1)
     q = q.reshape(B, T, key_dim // head_k_dim, head_k_dim).repeat_interleave(rep, dim=2)

@@ -175,6 +175,10 @@ def conv_steps() -> list[str]:
         for name, x, y in zip(("ext", "q", "k", "v"), out, eager):
             if not same_bits(x, y):
                 failures.append(f"conv_step {(B, T)}: the Triton kernel's {name} is not bitwise equal to eager")
+        stacked = torch.zeros(3, B, C, taps + T, dtype=torch.bfloat16, device=CUDA)
+        out = conv_step(state, merged[..., :C], weight, key_dim, value_dim, head_dim, head_dim, rep, ext_out=stacked[1])
+        if out[0].data_ptr() != stacked[1].data_ptr() or not same_bits(stacked[1], eager[0]) or stacked[0].any() or stacked[2].any():
+            failures.append(f"conv_step {(B, T)}: the Triton kernel did not write ext into ext_out alone")
     return failures
 
 
