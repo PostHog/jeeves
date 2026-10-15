@@ -51,6 +51,7 @@ class Config(PredictorConfig):
     rollout_ce_weight: float = 0.5
     anchor_ce_weight: float = 0.5
     anchor_batch: int = 8
+    anchor_limit: int = 0
     logprob_chunk: int = 128
     micro_groups: int = 2
     length_hinge: int = 2048
@@ -62,6 +63,13 @@ class Config(PredictorConfig):
     log_chain_chars: int = 1200
     sft_think_frac: float = 0.5
     chain_cache: str = "data/chains"
+    bucket: bool = False
+    chain_max_len: int = 0
+    unclosed_reward: float = 1.0
+    loop_penalty: float = 0.0
+    greedy_rollouts: int = 0
+    chain_lm_weight: float = 0.0
+    sft_truncate_frac: float = 0.0
 
 
 _TRITON_LOCK = threading.RLock()
@@ -85,6 +93,18 @@ def enable_threadsafe_triton() -> None:
             triton.runtime.autotuner.Autotuner.run = _locked_run(triton.runtime.autotuner.Autotuner.run)
             triton.runtime.jit.JITFunction.run = _locked_run(triton.runtime.jit.JITFunction.run)
             _TRITON_PATCHED = True
+
+
+def is_loop(text: str, min_chars: int = 16, repeats: int = 3) -> bool:
+    """A chain loops when some line of real content occurs `repeats` or more times."""
+    counts: dict[str, int] = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if len(line) >= min_chars:
+            counts[line] = counts.get(line, 0) + 1
+            if counts[line] >= repeats:
+                return True
+    return False
 
 
 def lr_lambda(warmup: int, total: int):
@@ -322,7 +342,6 @@ class Trainer(Predictor):
         n = int(round(cfg.sft_think_frac * len(train)))
         if n == 0:
             return {"with_chains": 0}
-        selected = sorted(random.Random(f"{cfg.seed}:sft-think").sample(range(len(train)), n))
         path = self.chain_cache_path()
         cached: dict[str, list[int]] = {}
         if path.exists():
@@ -332,6 +351,17 @@ class Trainer(Predictor):
                         row = json.loads(line)
                         cached[row["id"]] = row["chain"]
         key = lambda ex: f"{ex.record_id}/{ex.question_id}"
+        # Examples with a cached chain come first, so runs on overlapping data reuse chains instead of sampling new ones.
+        order = list(range(len(train)))
+        random.Random(f"{cfg.seed}:sft-think").shuffle(order)
+        order.sort(key=lambda i: key(train[i]) not in cached)
+        if cfg.chain_max_len:
+            # Train only on chains that close, stay short and never loop; examples without such a chain go without thinking.
+            def clean(i: int) -> bool:
+                chain, ok = split_chain(cached.get(key(train[i]), []), self.m)
+                return ok and len(chain) <= cfg.chain_max_len and not is_loop(self.encoder.tok.decode(chain))
+            order = [i for i in order if key(train[i]) in cached and clean(i)]
+        selected = sorted(order[:n])
         missing = [i for i in selected if key(train[i]) not in cached]
         mine = missing[self.rank::self.world]
         local = list(zip(mine, self.generate_chains([train[i] for i in mine], plain=True)[0])) if mine else []
@@ -346,44 +376,60 @@ class Trainer(Predictor):
                     fh.write(json.dumps({"id": key(train[i]), "chain": chain}) + "\n")
         for i, chain in local:
             cached[key(train[i])] = chain
-        closed = lengths = 0
+        closed = lengths = truncated = 0
+        cut_rng = random.Random(f"{cfg.seed}:sft-truncate")
         for i in selected:
             chain = cached[key(train[i])]
-            train[i].think = chain
             c, ok = split_chain(chain, self.m)
+            if cfg.sft_truncate_frac and ok and len(c) >= 32 and cut_rng.random() < cfg.sft_truncate_frac:
+                # Cut the chain without its </think>, as at the generation cap, so the head learns to use unfinished reasoning.
+                c, ok = c[:int(len(c) * cut_rng.uniform(0.25, 0.9))], False
+                chain, truncated = c, truncated + 1
+            train[i].think = chain
             closed += int(ok)
             lengths += len(c)
         return {"with_chains": len(selected), "generated": len(local), "from_cache": len(selected) - len(local),
-                "cache": str(path), "chains_closed": closed / max(1, len(selected)), "chain_mean_len": lengths / max(1, len(selected))}
+                "cache": str(path), "chains_closed": closed / max(1, len(selected)), "chain_mean_len": lengths / max(1, len(selected)),
+                "truncated": truncated}
 
     def train_sft(self, train: list[Example], dev: list[Example]) -> None:
         cfg = self.cfg
         self.model.eval()
         self.log(event="chains", **self.attach_chains(train))
         loader = make_loader(train, cfg.batch_size, self.m, shuffle=True, rank=self.rank, world_size=self.world, seed=cfg.seed,
-                             num_workers=cfg.num_workers)
+                             num_workers=cfg.num_workers, bucket=cfg.bucket)
         total = cfg.sft_epochs * len(loader)
         self.make_schedule(total)
         if self.step == 0:
             self.last_eval = self.evaluate(dev)
             self.log(event="eval", **self.last_eval)
-        acc = Metrics(("loss", "acc", "grad_norm", "tokens"), self.device)
+        acc = Metrics(("loss", "acc", "grad_norm", "tokens", "chain_nll"), self.device)
         t0 = time.time()
         self.model.train()
         start_epoch, skip = divmod(self.step, len(loader))
         for epoch in range(start_epoch, cfg.sft_epochs):
-            if self.world > 1:
+            if cfg.bucket:
+                loader.batch_sampler.set_epoch(epoch)
+            elif self.world > 1:
                 loader.sampler.set_epoch(epoch)
             for b_idx, batch in enumerate(loader):
                 if epoch == start_epoch and b_idx < skip:
                     continue
                 batch = batch.to(self.device)
-                logits = self.scores(self.model.hidden_states(batch.input_ids, batch.attention_mask), batch)
+                hidden = self.model.hidden_states(batch.input_ids, batch.attention_mask)
+                logits = self.scores(hidden, batch)
                 loss = self.head_nll(logits, batch).mean()
+                chain_nll = torch.zeros((), device=self.device)
+                mask = batch.chain_mask[:, 1:]
+                if cfg.chain_lm_weight and bool(mask.any()):
+                    # Teach the model to write its chains, not only to decide after them: the head loss alone never trains generation.
+                    logp = self.model.token_logprobs(hidden[:, :-1], batch.input_ids[:, 1:], cfg.logprob_chunk, 1.0, self.logit_bias)
+                    chain_nll = -(logp * mask).sum() / mask.sum()
+                    loss = loss + cfg.chain_lm_weight * chain_nll
                 loss.backward()
                 norm = self.optimizer_step()
                 acc.add(loss=loss, acc=(logits.argmax(-1) == batch.labels).float().mean(),
-                        grad_norm=norm, tokens=batch.attention_mask.sum().float())
+                        grad_norm=norm, tokens=batch.attention_mask.sum().float(), chain_nll=chain_nll.detach())
                 if self.step % cfg.log_every == 0:
                     vals = acc.means(self.world)
                     tokens = vals.pop("tokens") * acc.count * self.world
@@ -438,7 +484,7 @@ class Trainer(Predictor):
             self.last_eval = self.evaluate(dev, think=cfg.eval_think)
             self.log(event="eval", **self.last_eval)
         acc = Metrics(("loss", "pg", "ce_rollout", "ce_anchor", "reward", "rollout_acc", "grad_norm",
-                       "tokens", "mean_think_len", "closed_frac", "penalized_frac"), self.device)
+                       "tokens", "mean_think_len", "closed_frac", "penalized_frac", "loop_frac"), self.device)
         t0 = time.time()
         P, G = cfg.prompts_per_step, cfg.group
         n_rows = float(P * G)
@@ -446,7 +492,8 @@ class Trainer(Predictor):
         group_ids = [i for i in range(P) for _ in range(G)]
         rows_per_micro = cfg.micro_groups * G
         self.model.eval()
-        worker = RolloutWorker(self.generate_chains)
+        greedy = [i % G < cfg.greedy_rollouts for i in range(P * G)]
+        worker = RolloutWorker(lambda exs: self.generate_chains(exs, greedy=greedy))
 
         def submit_next() -> None:
             epoch, b, prompts = next(batches)
@@ -463,14 +510,16 @@ class Trainer(Predictor):
                 else:
                     submit_next()
             hinge = self.hinge_at(self.step, total)
+            loops = torch.tensor([cfg.loop_penalty > 0 and is_loop(self.encoder.tok.decode(split_chain(g, self.m)[0])) for g in generated],
+                                 dtype=torch.float32)
             cpu_micro = [collate_rollouts(expanded[s:s + rows_per_micro], generated[s:s + rows_per_micro], group_ids[s:s + rows_per_micro],
                                           self.m, lps[s:s + rows_per_micro]) for s in range(0, P * G, rows_per_micro)]
             mask_total = max(1.0, float(sum(int(mb.chain_mask[:, 1:].sum()) for mb in cpu_micro)))
             batch_tokens = float(sum(int(mb.attention_mask.sum()) for mb in cpu_micro))
             micro = [mb.pin_memory().to(self.device, non_blocking=True) for mb in cpu_micro]
-            stats = Metrics(("pg", "ce_rollout", "reward", "correct", "think_len", "closed", "penalized"), self.device)
+            stats = Metrics(("pg", "ce_rollout", "reward", "correct", "think_len", "closed", "penalized", "looped"), self.device)
             preds, probs = [], []
-            for mb in micro:
+            for k, mb in enumerate(micro):
                 with self.capture_lock:
                     think_len = (mb.attention_mask.sum(1) - mb.think_start - mb.suffix_len).float()
                     penalty = (torch.relu(think_len - hinge) / cfg.length_hinge).clamp(max=cfg.length_penalty_cap)
@@ -479,7 +528,9 @@ class Trainer(Predictor):
                     nll = self.head_nll(logits, mb)
                     with torch.no_grad():
                         p_correct = F.softmax(logits, dim=-1).gather(1, mb.labels[:, None]).squeeze(1)
-                        reward = p_correct * (1 - penalty)
+                        loop = loops[k * rows_per_micro:(k + 1) * rows_per_micro].to(self.device)
+                        keep = torch.where(mb.valid, 1.0, cfg.unclosed_reward) * (1 - cfg.loop_penalty * loop)
+                        reward = p_correct * (1 - penalty) * keep
                         gids = mb.group_ids - mb.group_ids.min()
                         gsum = torch.zeros(cfg.micro_groups, device=self.device).index_add_(0, gids, reward)
                         gcnt = torch.zeros(cfg.micro_groups, device=self.device).index_add_(0, gids, torch.ones_like(reward))
@@ -495,7 +546,7 @@ class Trainer(Predictor):
                     torch.cuda.current_stream().synchronize()
                 stats.add(pg=pg, ce_rollout=ce_roll, reward=reward.sum(),
                           correct=(logits.argmax(-1) == mb.labels).float().sum(), think_len=think_len.sum(),
-                          closed=mb.valid.float().sum(), penalized=(penalty > 0).float().sum())
+                          closed=mb.valid.float().sum(), penalized=(penalty > 0).float().sum(), looped=loop.sum())
             with self.capture_lock:
                 ce_anchor = self.anchor_loss(anchor_rng.sample(anchors, min(cfg.anchor_batch, len(anchors))))
                 (cfg.anchor_ce_weight * ce_anchor).backward()
@@ -505,7 +556,7 @@ class Trainer(Predictor):
                     pg=stats["pg"], ce_rollout=stats["ce_rollout"], ce_anchor=ce_anchor, reward=stats["reward"] / n_rows,
                     rollout_acc=stats["correct"] / n_rows, grad_norm=norm, tokens=batch_tokens,
                     mean_think_len=stats["think_len"] / n_rows, closed_frac=stats["closed"] / n_rows,
-                    penalized_frac=stats["penalized"] / n_rows)
+                    penalized_frac=stats["penalized"] / n_rows, loop_frac=stats["looped"] / n_rows)
             if self.step % cfg.log_every == 0:
                 vals = acc.means(self.world)
                 tokens = vals.pop("tokens") * acc.count * self.world
@@ -563,7 +614,8 @@ def run(cfg: Config) -> None:
         trainer.train_sft(train, dev)
     elif cfg.stage == "cispo":
         pool, p_drop = load_examples(str(data / "rl.jsonl"), enc, src, cfg.max_seq_len, extra_len=cfg.max_think, limit=cfg.train_limit, seed=cfg.seed)
-        anchors, a_drop = load_examples(str(data / "train.jsonl"), enc, src, cfg.max_seq_len, extra_len=cfg.max_think, seed=cfg.seed)
+        # Anchors are sampled a few per step, so a random subset of rows is enough and skips tokenising a large mix.
+        anchors, a_drop = load_examples(str(data / "train.jsonl"), enc, src, cfg.max_seq_len, extra_len=cfg.max_think, limit=cfg.anchor_limit, seed=cfg.seed)
         trainer.log(event="data", rl=len(pool), rl_dropped=p_drop, anchors=len(anchors), anchors_dropped=a_drop, dev=len(dev), sources=src)
         trainer.train_cispo(pool, anchors, dev)
     else:

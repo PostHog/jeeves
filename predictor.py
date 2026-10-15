@@ -113,7 +113,8 @@ class Predictor:
         return -(batch.targets * F.log_softmax(logits, dim=-1).masked_fill(~batch.opt_mask, 0.0)).sum(-1)
 
     @torch.no_grad()
-    def generate_chains(self, examples: list[Example], plain: bool = False) -> tuple[list[list[int]], list[list[float]]]:
+    def generate_chains(self, examples: list[Example], plain: bool = False,
+                        greedy: list[bool] | None = None) -> tuple[list[list[int]], list[list[float]]]:
         cfg = self.cfg
         chains: list[list[int]] = []
         lps: list[list[float]] = []
@@ -121,9 +122,10 @@ class Predictor:
             chunk = examples[start:start + cfg.gen_batch_size]
             ids, mask = collate_prompts(chunk, self.m, plain=plain)
             ids, mask = ids.to(self.device, non_blocking=True), mask.to(self.device, non_blocking=True)
+            rows = torch.tensor(greedy[start:start + cfg.gen_batch_size]) if greedy is not None else None
             gen, lp = self.model.generate_graphed(ids, attention_mask=mask, max_new_tokens=cfg.max_think, temperature=cfg.temperature,
                                                   eos_token_id=self.encoder.think_end_id, return_logprobs=True,
-                                                  capture_lock=self.capture_lock, logit_bias=self.logit_bias)
+                                                  capture_lock=self.capture_lock, logit_bias=self.logit_bias, greedy_rows=rows)
             lps.extend(lp.cpu().tolist())
             chains.extend(gen[:, ids.shape[1]:].cpu().tolist())
         return chains, lps

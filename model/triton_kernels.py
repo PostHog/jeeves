@@ -20,6 +20,12 @@ def sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+@lru_cache
+def decode_attention_stages(device: torch.device) -> int:
+    # Two stages of the key and value blocks need about 104 KB of shared memory, more than the 99 KB of consumer and workstation Blackwell (sm_120).
+    return 2 if torch.cuda.get_device_properties(device).shared_memory_per_block_optin >= 128 * 1024 else 1
+
+
 # Triton folds a float32 -> bf16 -> float32 round trip away and fuses what is left into FMAs, so rounding goes through the bits.
 @triton.jit
 def _round_to_bf16(x):
@@ -198,7 +204,7 @@ def decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tens
     _decode_attention_split[(B * Hkv, splits)](q, k_cache, v_cache, mask, partial_o, partial_lse, scale * LOG2E.value, L, keys_per_split,
                                                splits, *q.stride()[:3], *k_cache.stride()[:3], *v_cache.stride()[:3], mask.stride(0),
                                                mask.stride(2), HKV=Hkv, R=R, G=G, D=D, BLOCK_Q=block_q, BLOCK_N=DECODE_ATTENTION_BLOCK_N,
-                                               num_warps=4 if D <= 128 else 8, num_stages=2)
+                                               num_warps=4 if D <= 128 else 8, num_stages=decode_attention_stages(q.device))
     _decode_attention_combine[(B * Hkv, R * G)](partial_o, partial_lse, o, splits, *o.stride()[:3], HKV=Hkv, G=G, D=D, BLOCK_Q=block_q,
                                                 BLOCK_SPLITS=triton.next_power_of_2(splits), num_warps=4)
     return o

@@ -66,6 +66,8 @@ def main() -> None:
     dtype = getattr(torch, a.dtype)
     model, head, state = load_fused(a.checkpoint, a.model, a.device, dtype)
     tensors = {k: v.detach() for k, v in model.state_dict().items() if not k.endswith("inv_freq")}
+    if model.cfg.tie_word_embeddings:
+        tensors.pop("lm_head.weight", None)  # the loader ties it back to embed_tokens
     index = write_shards(tensors, out)
     (out / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
     torch.save({k: v.detach().cpu() for k, v in head.state_dict().items()}, out / "head.pt")
