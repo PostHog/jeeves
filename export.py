@@ -79,7 +79,7 @@ def main() -> None:
             shutil.copyfile(src / f, out / f)
     (out / "export.json").write_text(json.dumps({
         "source_checkpoint": a.checkpoint, "base_model": model_name, "dtype": a.dtype, "format": Encoder.FORMAT,
-        "head_dim": head.q.out_features, "temperature": head.temperature, "stage": state.get("stage"), "step": state.get("step"), "sources": state.get("sources"),
+        "head_dim": head.q.out_features, "temperature": head.temperature, "think_temperature": head.think_temperature, "stage": state.get("stage"), "step": state.get("step"), "sources": state.get("sources"),
         "metrics": state.get("metrics"), "training_config": state.get("config"),
     }, indent=2) + "\n")
     print(json.dumps({"out": str(out), "tensors": len(tensors), "shards": len(set(index["weight_map"].values())),
@@ -95,6 +95,7 @@ def load_head(path: Path, hidden_size: int, device: str | torch.device) -> Point
     head = PointerHead(hidden_size, meta["head_dim"]).to(device)
     head.load_state_dict(torch.load(path / "head.pt", map_location=device))
     head.temperature = float(meta.get("temperature", 1.0))
+    head.think_temperature = meta.get("think_temperature")
     return head.eval()
 
 

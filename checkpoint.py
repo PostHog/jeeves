@@ -36,4 +36,5 @@ class Checkpoint:
         model.lora.load_state_dict({k.removeprefix("lora."): v for k, v in tensors.items()})
         head.load_state_dict(torch.load(self.path / "head.pt", map_location=device, weights_only=True))
         head.temperature = float(self.metadata.get("temperature", 1.0))
+        head.think_temperature = self.metadata.get("think_temperature")
 

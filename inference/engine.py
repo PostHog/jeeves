@@ -521,9 +521,9 @@ class Engine:
         chains = [out[b][:n_out[b]] for b in range(B)]
         return chains, [bool(c) and c[-1] == self.eos for c in chains]
 
-    def readout(self, h: torch.Tensor, seq: list[int]) -> list[float]:
+    def readout(self, h: torch.Tensor, seq: list[int], think: bool = False) -> list[float]:
         opts = [t for t, tok in enumerate(seq) if tok == self.opt_end]
-        logits = self.head(h[opts][None], h[len(seq) - 1][None]).float()
+        logits = self.head(h[opts][None], h[len(seq) - 1][None], think=think).float()
         return F.softmax(logits[0], dim=-1).tolist()
 
     def reset(self, B: int) -> None:
@@ -596,7 +596,7 @@ class Engine:
             hr = self.extend(seqs, [len(p) + len(ch) for p, ch in zip(prompts, chains)], commit=False)
             for b in range(B):
                 if caps[b]:
-                    probs[b] = self.readout(hr[b], seqs[b])
+                    probs[b] = self.readout(hr[b], seqs[b], think=True)
         return [Result(probs=probs[b], thought=bool(caps[b]), chain=chains[b], closed=closed[b],
                        nothink_probs=nothink[b] if nothink is not None and wants_nothink[b] else None,
                        prompt_tokens=len(prompts[b]) - (P if b else 0))

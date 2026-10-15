@@ -8,13 +8,16 @@ class PointerHead(nn.Module):
         self.k = nn.Linear(d_embed, d_latent)
         self.scale = d_latent**-0.5
         self.temperature = 1.0
+        self.think_temperature: float | None = None  # after a reasoning chain; None means use temperature
 
     def forward(
         self, 
         questions: Tensor, # (B, K, D) 
-        decide: Tensor # (B, D)
+        decide: Tensor, # (B, D)
+        think: bool = False,
     ) -> Tensor:
         options = self.k(questions.to(self.k.weight.dtype))
         query = self.q(decide.to(self.q.weight.dtype))
         logits = (options @ query.unsqueeze(-1)).squeeze(-1) * self.scale
-        return logits if self.training or self.temperature == 1.0 else logits / self.temperature
+        t = self.think_temperature if think and self.think_temperature is not None else self.temperature
+        return logits if self.training or t == 1.0 else logits / t

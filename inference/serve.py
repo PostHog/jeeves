@@ -33,7 +33,7 @@ class Server:
         return response(record, model, opts, results, self.engine.encoder.tok, ms)
 
     def models(self) -> dict:
-        extra = {**self.info, "temperature": self.engine.head.temperature, "defaults": vars(self.defaults)}
+        extra = {**self.info, "temperature": self.engine.head.temperature, "think_temperature": self.engine.head.think_temperature, "defaults": vars(self.defaults)}
         return {"models": [{"name": name, "description": "Jeeves-9B: reasons before it decides, with calibrated probabilities.",
                             "release_date": RELEASE_DATE, **extra} for name in (MODEL_ID, "jev-latest")]}
 

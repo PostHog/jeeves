@@ -77,7 +77,7 @@ def score_examples(predictor: Predictor, examples: list[Example], think: bool, b
                 batch = collate_rollouts(chunk, generated, list(range(len(chunk))), predictor.m).to(predictor.device)
             else:
                 batch = collate_sft(chunk, predictor.m).to(predictor.device)
-            logits = predictor.scores(predictor.model.hidden_states(batch.input_ids, batch.attention_mask), batch)
+            logits = predictor.scores(predictor.model.hidden_states(batch.input_ids, batch.attention_mask), batch, think=think)
             probs = F.softmax(logits, dim=-1)
             torch.cuda.synchronize()
             per_row = (time.time() - t0) / len(chunk)
