@@ -1,0 +1,20 @@
+{
+  "files": {
+    "train.jsonl": {
+      "records": 351300,
+      "sha256": "148a624382d9bd2955f30a3138a481fcc08a730831e9fb4999f485c9184d0024"
+    },
+    "dev.jsonl": {
+      "records": 5138,
+      "sha256": "2530efe0c41ca9c56c1d361cccd3e33553881141c649b4ce6a613e8289177b3c"
+    },
+    "rl.jsonl": {
+      "records": 12623,
+      "sha256": "bccd6701ce33d5f70126bd14f96b7402e1ef00ff813eea05b610a5c13c0751d9"
+    },
+    "test.jsonl": {
+      "records": 2698,
+      "sha256": "4f57c98afec8c3504cdcf7382a0294e4cedaba4e1030cb0048007707ec79f539"
+    }
+  }
+}
