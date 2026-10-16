@@ -1,6 +1,6 @@
 # Jeeves – Reasoning improves Jev-like decision models
 
-A reasoning Jev-style classifier with a diffusion drafter, trained with SFT and CISPO.
+A Jev-style classifier that reasons when it is unsure, with a diffusion drafter, trained on public data.
 
 <img src="assets/smug.png" alt="Jeeves" width="220">
 
@@ -15,46 +15,46 @@ Inspired by [Kev](https://github.com/jaredpalmer/kev).
 
 ## Highlights
 
-- A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that thinks before it decides, with a block-4 diffusion drafter and the full training code and train/dev/test data.
-- Beats Kev-9B and Jev on test data it was never trained on (0.889 vs 0.822 and 0.857) and on JevBench's public tiers (0.935 vs 0.866 for Jev).
+- A 9B Jev-like model (Qwen3.5-9B, LoRA, pointer head) that reasons before it decides when it is unsure, with a block-4 diffusion drafter and the full training code and train/dev/test data.
+- Reasoning only when unsure, it beats Kev-9B, Jev and JevK5 on test data it was never trained on (0.905 vs 0.822, 0.857 and 0.802) and on JevBench's public tiers (0.896 vs 0.866 for Jev and 0.861 for JevK5).
 - Supports yes/no (`noul`), multiple-choice (`choice`), and rating (`score`) questions in the same request, through a Jev-compatible API.
-- About 0.3 s per request without thinking and a 3.3 s median with it on one H100 with `--precision fp8`. Can be sped up by truncating chain length.
+- About 20 ms per request without thinking and a 1.2 s median with it on one H100 with `--precision fp8`. Can be sped up by truncating chain length.
 - Runs on CUDA in bf16, or with FP8 linear layers (`--precision fp8`) on GPUs with compute capability 8.9 or higher. Inference also runs on Apple Silicon (MPS) in bf16 or FP8.
 
 ## Problem
 
-Jev-like models give calibrated decision probabilities, but at low accuracy. A lot of pipelines therefore rely on a reasoning model as a fallback. Jeeves trains a Jev-like Qwen3.5-9B (LoRA and a pointer head) using CISPO to reason before it decides.
+Jev-like models give calibrated decision probabilities, but at low accuracy. A lot of pipelines therefore rely on a reasoning model as a fallback. Jeeves trains a Jev-like Qwen3.5-9B (LoRA and a pointer head) to reason before it decides when it is unsure.
 
 This results in better performance on out of domain tasks, and outperforms Jev in JevBench hard (public).
 
 ## Results
 
-Accuracy with thinking, greedy, 2,560-token cap. The Kev-9B and Jev columns are the numbers Kev publishes.
+Jeeves v2 and v1 answer directly when their calibrated confidence is at least 0.9 and otherwise reason first (`nothink_threshold` 0.9, greedy, 2,560-token cap); the percentage is the share of questions that reasoned. JevK5 (v0.3) does not reason; we ran it ourselves on the same items. The Kev-9B and Jev columns are the numbers Kev publishes.
 
-| bench                                                        | Kev-9B                  | Jev                     | Jeeves                  |
-| ------------------------------------------------------------ | ----------------------- | ----------------------- | ----------------------- |
-| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                   | 0.857                   | <ins><b>0.889</b></ins> |
-| **Transfer overall** (MMLU-Pro and buried state)             | 0.579                   | <ins><b>0.800</b></ins> | 0.746                   |
-| **JevBench overall** (231 public items)                      | 0.715\*                 | 0.866                   | <ins><b>0.935</b></ins> |
-| QNLI                                                         | <ins><b>0.925</b></ins> | <ins><b>0.925</b></ins> | 0.913                   |
-| SciQ                                                         | 0.963                   | 0.988                   | <ins><b>0.991</b></ins> |
-| TweetEval offensive                                          | 0.775                   | <ins><b>0.813</b></ins> | <ins><b>0.813</b></ins> |
-| PAWS                                                         | 0.763                   | 0.788                   | <ins><b>0.875</b></ins> |
-| MMLU                                                         | 0.738                   | <ins><b>0.900</b></ins> | 0.793                   |
-| Emotion                                                      | 0.600                   | 0.588                   | <ins><b>0.647</b></ins> |
-| Held-out rule structures                                     | 0.896                   | 0.885                   | <ins><b>1.000</b></ins> |
-| Contrastive policies                                         | 0.900                   | 0.963                   | <ins><b>1.000</b></ins> |
-| MMLU-Pro (10-way)                                            | 0.515                   | <ins><b>0.840</b></ins> | 0.739                   |
-| Buried state                                                 | 0.740                   | 0.700                   | <ins><b>0.759</b></ins> |
-| Unknowable answered at p ≥ 0.9 (lower is better)             | <ins><b>0.000</b></ins> | 0.090                   | 0.055                   |
-| JevBench hard (111 public items)                             | 0.451\*                 | 0.730                   | <ins><b>0.865</b></ins> |
-| JevBench ECE (public items)                                  |                         | 0.049                   | <ins><b>0.037</b></ins> |
+| bench                                                        | Kev-9B                  | Jev                     | JevK5                   | Jeeves v1                      | Jeeves v2                       |
+| ------------------------------------------------------------ | ----------------------- | ----------------------- | ----------------------- | ------------------------------ | ------------------------------- |
+| **Test overall** (out-of-domain and held-out, item-weighted) | 0.822                   | 0.857                   | 0.802                   | 0.884 (41%)                    | <ins><b>0.905</b></ins> (39%)   |
+| **Transfer overall** (MMLU-Pro and buried state)             | 0.579                   | <ins><b>0.800</b></ins> | 0.561                   | 0.728 (86%)                    | 0.780 (76%)                     |
+| **JevBench overall** (231 public items)                      | 0.715\*                 | 0.866                   | 0.861                   | <ins><b>0.913</b></ins> (44%)  | 0.896 (29%)                     |
+| QNLI                                                         | 0.925                   | 0.925                   | 0.900                   | 0.912                          | <ins><b>0.950</b></ins>         |
+| SciQ                                                         | 0.963                   | 0.988                   | 0.948                   | <ins><b>0.991</b></ins>        | 0.983                           |
+| TweetEval offensive                                          | 0.775                   | 0.813                   | <ins><b>0.850</b></ins> | 0.825                          | 0.838                           |
+| PAWS                                                         | 0.763                   | 0.788                   | 0.838                   | <ins><b>0.875</b></ins>        | <ins><b>0.875</b></ins>         |
+| MMLU                                                         | 0.738                   | <ins><b>0.900</b></ins> | 0.690                   | 0.810                          | 0.845                           |
+| Emotion                                                      | 0.600                   | 0.588                   | 0.664                   | 0.638                          | <ins><b>0.707</b></ins>         |
+| Held-out rule structures                                     | 0.896                   | 0.885                   | 0.729                   | 0.979                          | <ins><b>1.000</b></ins>         |
+| Contrastive policies                                         | 0.900                   | 0.963                   | 0.827                   | 0.980                          | <ins><b>0.985</b></ins>         |
+| MMLU-Pro (10-way)                                            | 0.515                   | <ins><b>0.840</b></ins> | 0.504                   | 0.726                          | 0.770                           |
+| Buried state                                                 | 0.740                   | 0.700                   | 0.672                   | 0.733                          | <ins><b>0.802</b></ins>         |
+| Unknowable answered at p ≥ 0.9 (lower is better)             | <ins><b>0.000</b></ins> | 0.090                   | 0.009                   | <ins><b>0.000</b></ins>        | <ins><b>0.000</b></ins>         |
+| JevBench hard (111 public items)                             | 0.451\*                 | 0.730                   | 0.748                   | <ins><b>0.820</b></ins>        | 0.793                           |
+| JevBench ECE (public items)                                  |                         | 0.049                   | <ins><b>0.014</b></ins> | 0.028                          | 0.059                           |
 
 \* No Kev-9B JevBench result is published. These are Kev-8B (Qwen3).
 
 All JevBench numbers are on the public easy, standard and hard tiers (231 items). The sealed judge tier is not included, and the Jev and Kev numbers are restricted to the same public items.
 
-Without thinking the same checkpoint scores 0.804 on our test split (2,962 items), against 0.840 with it.
+Without thinking v2 scores 0.812 on our test split (2,962 items), against 0.851 reasoning when unsure. On held-out questions from the 15 public datasets new in v2 (maths, commonsense, tool choice and fact checking), it scores 0.853 and 0.900.
 
 ## Quickstart
 
@@ -176,18 +176,21 @@ The client connects to `http://127.0.0.1:8009` by default (or `JEEVES_BASE_URL`)
 
 | option              | default | effect                                                                       |
 | ------------------- | ------- | ---------------------------------------------------------------------------- |
-| `think`             | `true`  | `false` answers from the prompt alone (about 0.3 s)                          |
+| `think`             | `true`  | `false` answers from the prompt alone (about 20 ms)                          |
 | `max_think`         | 2560    | truncates each reasoning chain at this many tokens, then answers             |
 | `nothink_threshold` | `null`  | answers without thinking when the no-think confidence is at least this value |
 | `return_reasoning`  | `false` | adds each question's reasoning text to the response                          |
 
 On 325 dev questions, on one H100 with `--precision fp8`:
 
-| setting                                  | accuracy | mean reasoning tokens | median / p90 latency |
-| ---------------------------------------- | -------- | --------------------- | -------------------- |
-| full thinking                            | 0.825    | 1,138                 | 3.3 s / 17.1 s       |
-| `max_think` 768, `nothink_threshold` 0.9 | 0.806    | 344                   | 2.0 s / 5.6 s        |
-| no thinking                              | 0.775    | 0                     | about 0.3 s          |
+| setting                                   | accuracy | mean reasoning tokens | median / p90 latency |
+| ----------------------------------------- | -------- | --------------------- | -------------------- |
+| full thinking                             | 0.818    | 804                   | 1.9 s / 8.1 s        |
+| `nothink_threshold` 0.9                   | 0.822    | 578                   | 1.2 s / 8.2 s        |
+| `max_think` 1024, `nothink_threshold` 0.9 | 0.818    | 386                   | 1.2 s / 4.3 s        |
+| no thinking                               | 0.806    | 0                     | 22 ms / 46 ms        |
+
+v2 was trained on chains of at most 1,024 tokens, so lower caps cut most of its chains. These use v1's drafter.
 
 ## How it works
 
@@ -216,15 +219,14 @@ A pointer head scores each option with a scaled dot product between a query proj
 
 These are rare, largely unused tokens in the Qwen tokenizer. Ablations found that using plain text like "State" in the prompt instead worsened performance.
 Likewise, not repeating the questions after the reasoning block also decreases performance.
-The final probabilities are a softmax over the option scores, divided by a temperature fitted on the dev set.
+The final probabilities are a softmax over the option scores, divided by a temperature fitted on the dev set. Answers after reasoning get their own temperature.
 
 ### Training
 
-1. **SFT** (2 epochs, 596 steps on 8 GPUs). LoRA r=16 on all projections of Qwen3.5-9B plus the pointer head, trained on 19,126 questions from 12 public datasets and synthetic policy data. Half the questions carry a reasoning chain sampled from the base model.
-2. **CISPO** (a 624-step schedule stopped at step 402). 9,992 RL questions, 8 rollouts each at temperature 1, capped at 2,560 thinking tokens.
-3. **Calibration**. A single temperature fitted on dev, stored with the checkpoint.
+1. **SFT** (1 epoch, 16,867 steps on 4 GPUs). LoRA r=16 on all projections of Qwen3.5-9B plus the pointer head, trained on 453,531 questions from about 175 public sources: public datasets, the public OpenJev and Kev decision sets, third-party public decision datasets labelled by teacher models, prompt-injection sets and v1's data. About 15% of examples carry a reasoning chain sampled from earlier rounds of the model, kept only if it closes within 1,024 tokens, does not loop and reaches the right answer.
+2. **Calibration**. Two temperatures fitted on dev and stored with the checkpoint: 1.52 for direct answers and 5.42 for answers after reasoning. Every training chain reaches the right answer, so answers after reasoning come out overconfident and need the larger temperature.
 
-Stopping at step 402 keeps the best calibration and dev score. Past it, the head over-sharpens on the saturated RL pool.
+v1 was trained with SFT followed by CISPO. CISPO did not improve v2.
 
 ### Diffusion drafter
 
@@ -245,7 +247,7 @@ Block 4 is the default because it stays cheap when several questions are batched
 
 ### Data
 
-You can build the datasets locally using the prep scripts. This downloads the public datasets from Hugging Face at the revisions pinned in `prep/public.py`:
+You can build the datasets locally using the prep scripts. This downloads the public datasets at pinned revisions and writes train/dev/rl in the order listed in `prep/manifests/v2/`, checking their sha256:
 
 ```bash
 python -m prep.prep
@@ -255,7 +257,7 @@ Each public dataset stays under its own license.
 
 ### Training
 
-On 8 GPUs, with the data in `data/`, `bash run.sh` runs the whole pipeline:
+On 8 GPUs, with the data in `data/`, `bash run.sh` runs the whole v1 pipeline:
 
 ```bash
 torchrun --nproc_per_node 8 train.py sft --run-dir runs/sft
@@ -285,10 +287,12 @@ torchrun --nproc_per_node 8 train.py drafter --model runs/fused --block 4 --run-
 
 ## Limitations
 
-- Knowledge questions trail Jev (MMLU 0.793 vs 0.900, MMLU-Pro 0.739 vs 0.840).
-- Thinking is slow at the tail: 17 s at p90 with full chains on one H100. Use `max_think` and `nothink_threshold` when latency matters.
+- Knowledge questions trail Jev (MMLU 0.845 vs 0.900, MMLU-Pro 0.770 vs 0.840).
+- Thinking is slow at the tail: 8 s at p90 with full chains on one H100. Use `max_think` and `nothink_threshold` when latency matters.
 - The Kev and Jev comparisons outside JevBench use different items from the same sources.
 - No language consistency reward was included so thinking chains are not well interpretable.
+- v2 trails v1 on JevBench when reasoning only when unsure (0.896 vs 0.913): it is overconfident without reasoning on some long-policy and multi-hop items, so it skips reasoning on them. With reasoning on every item the two are level (0.922 vs 0.926).
+- The reasoning chains used for SFT are not published yet, so `prep.prep` rebuilds the training records but not the chains.
 
 ## Quote this
 

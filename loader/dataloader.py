@@ -225,7 +225,8 @@ def collate_sft(examples: list[Example], m: Markers) -> Batch:
             rows.append(CollateRow(example=ex, input_ids=ex.prompt + list(m.empty_think) + ex.remainder, group_id=i))
         else:
             chain, ok = split_chain(ex.think, m)
-            rows.append(CollateRow(example=ex, input_ids=ex.prompt + chain + ex.remainder, group_id=i, closed=ok))
+            span = (len(ex.prompt), len(ex.prompt) + len(chain) + int(ok))
+            rows.append(CollateRow(example=ex, input_ids=ex.prompt + chain + ex.remainder, group_id=i, closed=ok, chain_span=span))
     return collate(rows, m)
 
 
@@ -259,8 +260,44 @@ def collate_rollouts(examples: list[Example], generated: list[list[int]], group_
     return collate(rows, m)
 
 
+class LengthBucketBatchSampler:
+    """Shuffled batches of similar-length examples: a pool of 64 batches is sorted by length and cut into batches, so
+    padding to each batch's longest example wastes little; the batches are then shuffled. Ranks take every world-th batch."""
+
+    def __init__(self, lengths: list[int], batch_size: int, seed: int, rank: int = 0, world_size: int = 1, pool: int = 64):
+        self.lengths, self.batch_size, self.seed, self.rank, self.world, self.pool = lengths, batch_size, seed, rank, world_size, pool
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def batches(self) -> list[list[int]]:
+        rng = random.Random(f"{self.seed}:bucket:{self.epoch}")
+        order = list(range(len(self.lengths)))
+        rng.shuffle(order)
+        span = self.batch_size * self.pool
+        out = []
+        for start in range(0, len(order), span):
+            chunk = sorted(order[start:start + span], key=self.lengths.__getitem__)
+            out += [chunk[i:i + self.batch_size] for i in range(0, len(chunk) - self.batch_size + 1, self.batch_size)]
+        rng.shuffle(out)
+        return out[:len(out) - len(out) % self.world][self.rank::self.world]
+
+    def __iter__(self):
+        return iter(self.batches())
+
+    def __len__(self) -> int:
+        full = sum((min(self.batch_size * self.pool, len(self.lengths) - s)) // self.batch_size
+                   for s in range(0, len(self.lengths), self.batch_size * self.pool))
+        return full // self.world
+
+
 def make_loader(examples: list[Example], batch_size: int, m: Markers, shuffle: bool, rank: int = 0, world_size: int = 1,
-                seed: int = 0, drop_last: bool = True, num_workers: int = 2) -> DataLoader:
+                seed: int = 0, drop_last: bool = True, num_workers: int = 2, bucket: bool = False) -> DataLoader:
+    if bucket:
+        sampler = LengthBucketBatchSampler([len(ex.full) + len(ex.think or []) for ex in examples], batch_size, seed, rank, world_size)
+        return DataLoader(examples, batch_sampler=sampler, collate_fn=partial(collate_sft, m=m), num_workers=num_workers,
+                          pin_memory=True, persistent_workers=num_workers > 0)
     sampler = DistributedSampler(examples, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=seed,
                                  drop_last=drop_last) if world_size > 1 else None
     return DataLoader(examples, batch_size=batch_size, shuffle=shuffle and sampler is None, sampler=sampler,

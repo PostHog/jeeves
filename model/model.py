@@ -813,7 +813,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                          sync_every: int = 16, warmup_steps: int = 2, window_step: int = 512,
                          compact_below: float = 0.75, return_logprobs: bool = False,
                          capture_lock=None,
-                         logit_bias: torch.Tensor | None = None):
+                         logit_bias: torch.Tensor | None = None, greedy_rows: torch.Tensor | None = None):
         eos = self.cfg.eos_token_id if eos_token_id is None else eos_token_id
         B, T = input_ids.shape
         device = input_ids.device
@@ -834,7 +834,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         st = {"tok": torch.zeros(B, 1, dtype=torch.long, device=device), "pos": (position_ids[:, -1:] + 1).contiguous(),
               "done": torch.zeros(B, dtype=torch.bool, device=device), "rows": torch.arange(B, device=device),
-              "lp": torch.zeros(B, dtype=torch.float32, device=device)}
+              "lp": torch.zeros(B, dtype=torch.float32, device=device),
+              "greedy": (greedy_rows.to(device=device, dtype=torch.bool) if greedy_rows is not None
+                         else torch.zeros(B, dtype=torch.bool, device=device))}
         out = torch.full((B, max_new_tokens), eos, dtype=torch.long, device=device)
         out_lp = torch.zeros(B, max_new_tokens, dtype=torch.float32, device=device)
         inv_t = 1.0 / temperature if temperature > 0 else 1.0
@@ -842,7 +844,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         def sample(lg: torch.Tensor) -> torch.Tensor:
             if temperature <= 0:
                 return lg.argmax(-1)
-            return (lg * inv_t - torch.empty_like(lg).exponential_().log()).argmax(-1)
+            # Greedy rows drop the Gumbel noise, so they decode the argmax while their logprobs stay at the sampling temperature.
+            noise = torch.empty_like(lg).exponential_().log().masked_fill(st["greedy"][:, None], 0.0)
+            return (lg * inv_t - noise).argmax(-1)
 
         def commit(lg: torch.Tensor, nxt: torch.Tensor) -> None:
             nxt = torch.where(st["done"], torch.full_like(nxt, eos), nxt)
@@ -889,7 +893,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     break
                 if alive.numel() < compact_below * st["rows"].numel():
                     cache.compact(alive)
-                    for key in ("tok", "pos", "done", "rows", "lp"):
+                    for key in ("tok", "pos", "done", "rows", "lp", "greedy"):
                         st[key] = st[key].index_select(0, alive).contiguous()
                 graph = None
             elif stop_on_eos and (i + 1) % sync_every == 0 and bool(st["done"].all()):

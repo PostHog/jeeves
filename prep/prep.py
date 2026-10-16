@@ -1,3 +1,11 @@
+"""Build Jeeves' training data from public sources: `python -m prep.prep` writes train/dev/rl/test.jsonl and manifest.json.
+
+Every source is converted into a pool of rows keyed by id: v1's data (the public datasets in public.py and the synthetic
+generators), third-party decision sets (thirdparty.py), decider's converted datasets (decider.py), general-skill datasets
+(skills.py) and prompt-injection data (injection.py). train/dev/rl.jsonl are then read off the ordered id lists in
+manifests/<mix>/ and checked against the sha256 hashes there. Rows removed during decontamination are simply absent
+from the id lists.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +15,7 @@ import json
 import os
 import random
 import sys
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -16,10 +25,11 @@ from tokenizers import Tokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from prep import composition, contrastive, night2, public, semif, transfer
+from prep import composition, contrastive, decider, injection, mix, night2, public, semif, skills, thirdparty, transfer
 from prep.format import DataFormat, option_text, render, state_hash, write_jsonl
 
 SPLITS = ("train", "rl", "dev", "test")
+MANIFESTS = Path(__file__).resolve().parent / "manifests"
 RL_FRACTION = {
     "wanli": 0.4, "semif": 0.4,
     "contrastive": 0.4, "compositional": 0.4, "night2_dates": 0.4, "mnli": 0.4, "boolq": 0.4,
@@ -248,54 +258,29 @@ def validate(records: list[dict]) -> None:
             q.options()
 
 
-def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Download public datasets and generate policy data in kev's labelled-request form.")
-    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "data"))
-    ap.add_argument("--seed", default="20260918")
-    ap.add_argument("--train", type=int, default=4500)
-    ap.add_argument("--dev", type=int, default=80)
-    ap.add_argument("--test", type=int, default=80)
-    ap.add_argument("--variants-per-source", type=int, default=12)
-    ap.add_argument("--contrastive-pairs", type=int, default=448)
-    ap.add_argument("--contrastive-eval-pairs", type=int, default=16)
-    ap.add_argument("--structures", type=int, default=60)
-    ap.add_argument("--groups-per-structure", type=int, default=28)
-    ap.add_argument("--dev-shape-groups", type=int, default=4)
-    ap.add_argument("--holdout-shape-groups", type=int, default=8)
-    ap.add_argument("--night2-date-pairs", type=int, default=600)
-    ap.add_argument("--night2-unknowable-pairs", type=int, default=60)
-    ap.add_argument("--night2-assertions", type=int, default=3200)
-    ap.add_argument("--no-night2", action="store_true")
-    ap.add_argument("--mmlu-pro", type=int, default=200)
-    ap.add_argument("--buried", type=int, default=80)
-    ap.add_argument("--unknowable-eval-pairs", type=int, default=5)
-    ap.add_argument("--semif-tasks", default=str(Path(__file__).resolve().parents[1] / "data" / "semif" / "authored144.jsonl"))
-    ap.add_argument("--wanli-eval", type=int, default=256)
-    ap.add_argument("--wanli-train", type=int, default=4500)
-    ap.add_argument("--rl-fraction", type=float, default=None)
-    ap.add_argument("--rl-target", type=int, default=10000)
-    ap.add_argument("--sources", default=",".join(public.TRAINABLE + public.EVAL_ONLY))
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3.5-9B")
-    ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--force", action="store_true")
-    a = ap.parse_args(argv)
+# v1's data, which v2's mix includes as is
+V1 = argparse.Namespace(
+    seed="20260918", train=4500, dev=80, test=80, variants_per_source=12, contrastive_pairs=448, contrastive_eval_pairs=16,
+    structures=60, groups_per_structure=28, dev_shape_groups=4, holdout_shape_groups=8, night2_date_pairs=600,
+    night2_unknowable_pairs=60, night2_assertions=3200, no_night2=False, mmlu_pro=200, buried=80, unknowable_eval_pairs=5,
+    wanli_eval=256, wanli_train=4500, rl_target=10000, sources=",".join(public.TRAINABLE + public.EVAL_ONLY),
+    tokenizer="Qwen/Qwen3.5-9B")
+SEMIF = ("https://raw.githubusercontent.com/TheoLeeCJ/SemIf-OpenJev/23cf1f39fc9534fe81437200959b6dfc7106e45a/benchmarks/data/authored144.jsonl",
+         "8162d1c73f925af64453f1ec05ef36d583b3815bf698e60f0d454bd11537e079")
 
-    if a.smoke:
-        a.train, a.dev, a.test, a.variants_per_source = 12, 6, 6, 2
-        a.contrastive_pairs, a.contrastive_eval_pairs = 4, 2
-        a.structures, a.groups_per_structure, a.dev_shape_groups, a.holdout_shape_groups = 4, 2, 1, 1
-        a.night2_date_pairs, a.night2_unknowable_pairs, a.night2_assertions = 3, 2, 20
-        a.mmlu_pro, a.buried, a.unknowable_eval_pairs = 8, 8, 1
-        a.wanli_eval, a.wanli_train = 12, 12
 
-    out = Path(a.out)
-    if out.exists() and any(out.iterdir()) and not a.force:
-        raise FileExistsError(f"{out} is not empty; pass --force to overwrite")
-    out.mkdir(parents=True, exist_ok=True)
+def semif_tasks(dl: Path) -> Path:
+    path = dl / "semif" / "authored144.jsonl"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(SEMIF[0], path)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != SEMIF[1]:
+        raise ValueError(f"{path} does not match the pinned SemIf tasks")
+    return path
+
+
+def build_v1(a: argparse.Namespace, semif_tasks: Path) -> tuple[dict[str, list[dict]], dict[str, Any]]:
     sources = [s for s in a.sources.split(",") if s]
-    unknown = set(sources) - set(public.SOURCES)
-    if unknown:
-        raise ValueError(f"unknown sources: {sorted(unknown)}")
     admission = Admission(a.tokenizer)
     revisions = resolve_revisions(sources)
     parts: dict[str, list[dict]] = {s: [] for s in SPLITS}
@@ -305,17 +290,17 @@ def main(argv: list[str] | None = None) -> None:
                                             "admission_headroom": HEADROOM},
                                 "trainable_sources": [s for s in sources if s in public.TRAINABLE],
                                 "eval_only_sources": [s for s in sources if s in public.EVAL_ONLY],
-                                "dataset_revisions": revisions, "admission": {}, "files": {}}
+                                "dataset_revisions": revisions, "admission": {}}
 
     for source in sources:
         report: Counter = Counter()
         repo = public.REPOS[source].partition(":")[0]
-        eval_pool = public.build(source, "eval", max(3 * (a.dev + a.test), 600 if not a.smoke else 60), a.seed, revisions[repo])
+        eval_pool = public.build(source, "eval", max(3 * (a.dev + a.test), 600), a.seed, revisions[repo])
         chosen = select_unique(eval_pool, a.dev + a.test, seen, admission, report)
         parts["dev"].extend(chosen[:a.dev])
         parts["test"].extend(chosen[a.dev:])
         if source in public.TRAINABLE:
-            train_pool = public.build(source, "train", max(3 * a.train, 800 if not a.smoke else 80), a.seed, revisions[repo])
+            train_pool = public.build(source, "train", max(3 * a.train, 800), a.seed, revisions[repo])
             parts["train"].extend(select_unique(train_pool, a.train, seen, admission, report))
         manifest["admission"][source] = dict(report)
         print(f"{source}: {dict(report)}", flush=True)
@@ -348,7 +333,7 @@ def main(argv: list[str] | None = None) -> None:
                                "holdout_shapes": list(composition.DEV_SHAPES + composition.TEST_SHAPES)}
     print(f"composition: {len(comp)} train, {len(comp_dev)} dev, {len(held)} held-out dev/test", flush=True)
 
-    authored = semif.authored_records(Path(a.semif_tasks))
+    authored = semif.authored_records(semif_tasks)
     groups = sorted({r["_meta"]["group_id"] for r in authored})
     random.Random(f"{a.seed}-semif").shuffle(groups)
     n_g = len(groups)
@@ -417,25 +402,100 @@ def main(argv: list[str] | None = None) -> None:
                               "sources": sorted({r["_meta"]["source"] for r in kept})}
         print(f"night2: {len(kept)} train records ({len(night) - len(kept)} dropped for eval overlap)", flush=True)
 
-    fractions = {k: a.rl_fraction for k in RL_FRACTION} if a.rl_fraction is not None else RL_FRACTION
-    parts["train"], parts["rl"] = reserve_rl(parts["train"], a.seed, fractions, a.rl_target if not a.smoke else 200)
-    manifest["rl_fraction"] = fractions
+    parts["train"], parts["rl"] = reserve_rl(parts["train"], a.seed, RL_FRACTION, a.rl_target)
+    manifest["rl_fraction"] = RL_FRACTION
     manifest["rl_target"] = a.rl_target
     manifest["sft_budget"] = SFT_BUDGET
     for split in ("train", "rl"):
         random.Random(f"{a.seed}-{split}").shuffle(parts[split])
-    for split, records in parts.items():
+    for records in parts.values():
         validate(records)
-        path = out / f"{split}.jsonl"
-        write_jsonl(path, records)
-        manifest["files"][path.name] = {
-            "records": len(records), "questions": sum(len(r["questions"]) for r in records),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "sources": dict(sorted(Counter(r["_meta"]["source"] for r in records).items())),
-            "question_sources": dict(sorted(Counter(q["src"] for r in records for q in r["questions"].values()).items())),
-        }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(json.dumps({k: {"records": v["records"], "questions": v["questions"]} for k, v in manifest["files"].items()}, indent=2))
+    return parts, manifest
+
+
+def build_pool(dl: Path, v1: dict[str, list[dict]], pi_ids: list[str]) -> mix.Pool:
+    pool = mix.Pool()
+    for split in ("train", "rl", "dev", "test"):
+        pool.add(v1[split])
+    for rows in thirdparty.build(dl / "thirdparty").values():
+        pool.add(rows)
+    pool.add(decider.build(dl / "decider", [mix.as_read(r) for r in v1["dev"] + v1["test"]]))
+    for train, dev in skills.build(dl / "skills").values():
+        pool.add(train + dev, ascii=True)
+    pool.add(injection.build(dl / "injection", pi_ids, list(pool.rows.values())), ascii=True)
+    return pool
+
+
+def injection_ids(ids: list[str]) -> list[str]:
+    """The injection set's ids in row order: its rows carry their row number."""
+    return sorted({i for i in ids if i.startswith("pi_")}, key=lambda i: int(i.split("/")[1].split("_")[0]))
+
+
+def use_hf_cache(root: Path) -> None:
+    """Keep Hugging Face downloads under the download directory unless HF_HOME or HF_HUB_CACHE is set."""
+    if os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE"):
+        return
+    import datasets.config
+    import huggingface_hub.constants
+
+    huggingface_hub.constants.HF_HUB_CACHE = str(root / "hub")
+    huggingface_hub.constants.HF_XET_CACHE = str(root / "xet")
+    datasets.config.HF_DATASETS_CACHE = root / "datasets"
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Download the public datasets at pinned revisions and build Jeeves' training data.")
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1] / "data"))
+    ap.add_argument("--downloads", help="download directory (default: <out>/downloads)")
+    ap.add_argument("--ids", default=str(MANIFESTS / "v2"), help="directory of the mix's id lists and expected hashes")
+    ap.add_argument("--make-ids", metavar="MIX", help="write --ids from the train/dev/rl.jsonl files of an existing mix instead")
+    ap.add_argument("--force", action="store_true")
+    a = ap.parse_args(argv)
+
+    out, ids_dir = Path(a.out), Path(a.ids)
+    dl = Path(a.downloads) if a.downloads else out / "downloads"
+    use_hf_cache(dl / "hf")
+    if out.exists() and any(p.suffix == ".jsonl" for p in out.iterdir()) and not a.force:
+        raise FileExistsError(f"{out} already has data; pass --force to overwrite")
+    out.mkdir(parents=True, exist_ok=True)
+    if a.make_ids:
+        ids = {s: [json.loads(line)["_meta"]["id"] for line in open(Path(a.make_ids) / f"{s}.jsonl")] for s in mix.SPLITS}
+        expected = {}
+    else:
+        ids = {s: mix.read_ids(ids_dir / f"{s}.ids.gz") for s in mix.SPLITS}
+        expected = json.loads((ids_dir / "manifest.json").read_text())["files"]
+
+    v1, v1_manifest = build_v1(V1, semif_tasks(dl))
+    pool = build_pool(dl, v1, injection_ids([i for s in mix.SPLITS for i in ids[s]]))
+
+    if a.make_ids:
+        for s in mix.SPLITS:
+            ids[s], unmatched = mix.ids_of(Path(a.make_ids) / f"{s}.jsonl", pool)
+            if unmatched:
+                raise ValueError(f"{s}: {len(unmatched)} rows of {a.make_ids} are not in the pool, e.g. "
+                                 f"{[r['_meta']['id'] for r in unmatched[:5]]}")
+            mix.write_ids(ids_dir / f"{s}.ids.gz", ids[s])
+            expected[f"{s}.jsonl"] = {"records": len(ids[s]),
+                                      "sha256": hashlib.sha256((Path(a.make_ids) / f"{s}.jsonl").read_bytes()).hexdigest()}
+
+    files = {f"{s}.jsonl": mix.write_split(pool, ids[s], out / f"{s}.jsonl") for s in mix.SPLITS}
+    write_jsonl(out / "test.jsonl", v1["test"])
+    files["test.jsonl"] = {"records": len(v1["test"]), "sha256": hashlib.sha256((out / "test.jsonl").read_bytes()).hexdigest()}
+    if a.make_ids:
+        expected["test.jsonl"] = {k: files["test.jsonl"][k] for k in ("records", "sha256")}
+        (ids_dir / "manifest.json").write_text(json.dumps({"files": expected}, indent=2) + "\n")
+    sources = {"thirdparty": {"openjev_v1.1": thirdparty.OJ11, "openjev": thirdparty.OJ, "kev": thirdparty.KEV,
+                              "kev_github": thirdparty.KEV_GITHUB, "spark": thirdparty.SPARK, "typed_decisions": thirdparty.TYPED},
+               "decider": {"code": [decider.REPO, decider.COMMIT], "datasets": decider.PROVENANCE},
+               "skills": {n: v[:3] for n, v in skills.SOURCES.items()},
+               "injection": {n: v[:2] for n, v in injection.REPOS.items()},
+               "semif_tasks": SEMIF}
+    manifest = {"ids": ids_dir.name, "files": files, "pool_rows": len(pool.rows), "sources": sources, "v1": v1_manifest}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    bad = [f for f, e in expected.items() if files[f]["sha256"] != e["sha256"]]
+    print(json.dumps({f: {k: v[k] for k in ("records", "sha256")} for f, v in files.items()}, indent=2))
+    if bad:
+        raise ValueError(f"{bad} do not match the expected sha256 in {ids_dir / 'manifest.json'}")
 
 
 if __name__ == "__main__":

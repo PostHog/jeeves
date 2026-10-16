@@ -100,12 +100,12 @@ class Predictor:
             self.model.train(model_training)
             self.head.train(head_training)
 
-    def scores(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def scores(self, hidden: torch.Tensor, batch: Batch, think: bool = False) -> torch.Tensor:
         B, K = batch.opt_mask.shape
         flat = hidden.reshape(-1, hidden.shape[-1])
         decide = flat.index_select(0, batch.decide_index)
         options = flat.index_select(0, batch.opt_index.reshape(-1)).view(B, K, -1)
-        logits = self.head(options, decide).float()
+        logits = self.head(options, decide, think=think).float()
         return logits.masked_fill(~batch.opt_mask, float("-inf"))
 
     @staticmethod
@@ -113,7 +113,8 @@ class Predictor:
         return -(batch.targets * F.log_softmax(logits, dim=-1).masked_fill(~batch.opt_mask, 0.0)).sum(-1)
 
     @torch.no_grad()
-    def generate_chains(self, examples: list[Example], plain: bool = False) -> tuple[list[list[int]], list[list[float]]]:
+    def generate_chains(self, examples: list[Example], plain: bool = False,
+                        greedy: list[bool] | None = None) -> tuple[list[list[int]], list[list[float]]]:
         cfg = self.cfg
         chains: list[list[int]] = []
         lps: list[list[float]] = []
@@ -121,9 +122,10 @@ class Predictor:
             chunk = examples[start:start + cfg.gen_batch_size]
             ids, mask = collate_prompts(chunk, self.m, plain=plain)
             ids, mask = ids.to(self.device, non_blocking=True), mask.to(self.device, non_blocking=True)
+            rows = torch.tensor(greedy[start:start + cfg.gen_batch_size]) if greedy is not None else None
             gen, lp = self.model.generate_graphed(ids, attention_mask=mask, max_new_tokens=cfg.max_think, temperature=cfg.temperature,
                                                   eos_token_id=self.encoder.think_end_id, return_logprobs=True,
-                                                  capture_lock=self.capture_lock, logit_bias=self.logit_bias)
+                                                  capture_lock=self.capture_lock, logit_bias=self.logit_bias, greedy_rows=rows)
             lps.extend(lp.cpu().tolist())
             chains.extend(gen[:, ids.shape[1]:].cpu().tolist())
         return chains, lps
@@ -179,7 +181,7 @@ class Predictor:
             chunk = think_shard[start:start + cfg.eval_batch_size]
             generated, _ = self.generate_chains(chunk)
             batch = collate_rollouts(chunk, generated, list(range(len(chunk))), self.m).to(self.device)
-            logits = self.scores(self.model.hidden_states(batch.input_ids, batch.attention_mask), batch)
+            logits = self.scores(self.model.hidden_states(batch.input_ids, batch.attention_mask), batch, think=True)
             correct = (logits.argmax(-1) == batch.labels).float()
             max_p = F.softmax(logits, dim=-1).amax(-1)
             closed = batch.valid.float()
